@@ -958,7 +958,7 @@ function syncScene() {
     if (!railMesh.userData.up) { railMesh.geometry = vostokGeoms.tube; railMesh.userData.up = true; }
     railMesh.position.set(BED.w/2, M.beam.z + VOSTOK_TUBE.dy, M.beam.y + VOSTOK_TUBE.dz);
     railMesh.visible = true;
-    vRailMesh.position.set(BED.w/2, M.beam.z + VOSTOK_TUBE.dy - 10 - 4.5, M.beam.y + VOSTOK_TUBE.dz);
+    vRailMesh.position.set(BED.w/2, M.beam.z + VOSTOK_TUBE.dy + 10 + 4.5, M.beam.y + VOSTOK_TUBE.dz);
     vRailMesh.visible = true;
   } else {
     rail.visible = true;
