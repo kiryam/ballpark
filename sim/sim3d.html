@@ -38,7 +38,7 @@
   <button id="replayClose" style="background:#b54835;padding:4px 10px;font-size:12px;margin:0">✕</button>
 </div>
 <div id="hud">IDEX: two carriages on one X gantry · inactive one parks · lateral touch by a non-nozzle element = ball moved<br>
-  LMB — orbit · wheel — zoom · drag the ball with the mouse</div>
+  dots: green=nozzle · orange=PIN · violet=bltouch · red=other · LMB orbit · wheel zoom</div>
 </div>
 <div class="right">
   <div class="panel">
@@ -216,7 +216,7 @@ const M = {
       const surf = BALL_CZ + Math.sqrt(BALL_R*BALL_R - horiz*horiz);
       const zc = surf - e.zo - n.z;
       if (zc < zFloorLogical || zc > zTopLogical + 1e-9) continue;
-      if (!best || zc > best.z) best = {z: zc, el: e.name};
+      if (!best || zc > best.z) best = {z: zc, el: e.name, dx: e.dx, dy: e.dy};
     }
     return best;
   },
@@ -316,7 +316,9 @@ const M = {
         this.clicks++;
         const good = hit.el === 'nozzle';
         if (!good) this.bad++;
-        mark(w.x, w.y, hit.z, good ? 0x3fd35f : 0xff5a3d);
+        // mark AT the element's contact point (pin clicks show on the pin),
+        // colored per element - a green dot can only be a NOZZLE click
+        mark(w.x + (hit.dx || 0), w.y + (hit.dy || 0), hit.z, markColor(hit.el));
         log(`${good?'🔵':'🔴'} ${hit.el} Z=${hit.z.toFixed(2)} at ${pos.x.toFixed(1)},${pos.y.toFixed(1)}`, good?'good':'bad');
       } else res = {triggered: false, x: pos.x, y: pos.y, z: c.fz};
       // real click: lever pre-travel (Z trigger lag) + X/Y slop
@@ -353,8 +355,7 @@ const M = {
       if (g.gap <= 0 && g.gap < prevGap - 1e-6) {
         if (c.kind === 'probe' && g.el === 'nozzle') {
           this.clicks++;
-          const w = this.world();
-          mark(w.x, w.y, pos.z + dz/len*done, 0x3fd35f);
+          mark(g.ex, g.ey, pos.z + dz/len*done, markColor('nozzle'));
           log(`🔵 nozzle (lateral) at carriage X${this.pos().x.toFixed(1)} Z${(pos.z + dz/len*done).toFixed(2)}`, 'good');
           this.lastProbe = {triggered: true, x: this.pos().x, y: this.pos().y, z: this.pos().z, el: 'nozzle'};
           return true;
@@ -395,6 +396,12 @@ function gmon(line, cur) {
   el._cur = cur === undefined ? null : cur;
   el.innerHTML = ((el._lines || []).concat(el._cur ? ['<b style="color:#ffd479">' + el._cur + '</b>'] : [])).join('\n');
   el.scrollTop = el.scrollHeight;
+}
+function markColor(el) {
+  if (el === 'nozzle') return 0x3fd35f;                    // green: nozzle only
+  if (el === 'pin') return 0xff9500;                       // orange: decoy pin
+  if (el && el.indexOf('bltouch') === 0) return 0xb06cff;  // violet
+  return 0xff5a3d;                                         // red: sock/block/duct
 }
 function mark(wx, wy, z, color) { S.marks.push({wx, wy, z, color, t: S.hist.length}); }
 // LSQ sphere fit + RANSAC
