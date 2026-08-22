@@ -697,26 +697,29 @@ let sbGeometry = null;
 //   three.x = fx - fNozzle.x, three.y = fy - fNozzle.y (up), three.z = -(fz - fNozzle.z)
 // each STL is centered on its own bbox in JS, so only the delta matters.
 const VOSTOK_PARTS = {
+  // mm relative to the nozzle in SIM axes (x right, y up, z front),
+  // mapped from Fusion assembly centers: three = (fx-Nx, fz-Nz, -(fy-Ny))
+  // [Fusion: X beam, Z UP, Y depth, front = -Y]
   L: [ // nozzle (Fusion world): (45.0, -6.22, -9.35) cm
-    ['vL_body.stl',    0,    6.7, -73.5],   // Bereza body, Goliath 4010 variant
-    ['vL_hotend.stl',  0,   18.6, -37.4],
-    ['vL_cool.stl',  -11.1, 11.1, -92.3],
-    ['vL_mf.stl',      0,   28.2, -111.0],
-    ['vL_carr.stl',   -5.5, 50.7, -110.0],
-    ['vL_fan.stl',     0,  -17.3, -73.5],
-    ['vL_spacer.stl',  0,   67.7, -71.5],
+    ['vL_body.stl',    0,     73.5,  -6.7],   // Bereza body, Goliath 4010
+    ['vL_hotend.stl',  0,     37.4, -18.6],
+    ['vL_cool.stl',  -11.05,  81.5, -11.05],
+    ['vL_mf.stl',      0,    111.0, -28.2],
+    ['vL_carr.stl',   -5.5,  110.0, -50.7],
+    ['vL_fan.stl',     0,     73.5,  17.3, Math.PI],  // 180-deg part flip
+    ['vL_spacer.stl',  0,     71.5, -67.7],
   ],
   R: [ // nozzle: (50.5, -6.22, -9.35) cm
-    ['vR_body.stl',    0,    6.7, -73.5],   // Bereza body, Goliath 4010 variant
-    ['vR_hotend.stl',  0,   18.6, -37.4],
-    ['vR_cool.stl',   10.5, 11.1, -92.5],
-    ['vR_mf.stl',      0,   28.2, -111.0],
-    ['vR_carr.stl',    5.5, 50.7, -110.0],
-    ['vR_fan.stl',     0,  -17.3, -73.5],
-    ['vL_spacer.stl',  0,   67.7, -71.5],   // spacer is shared L/R
+    ['vR_body.stl',    0,     73.5,  -6.7],
+    ['vR_hotend.stl',  0,     37.4, -18.6],
+    ['vR_cool.stl',   10.5,  83.5, -11.05],
+    ['vR_mf.stl',      0,    111.0, -28.2],
+    ['vR_carr.stl',    5.5,  110.0, -50.7],
+    ['vR_fan.stl',     0,     73.5,  17.3, Math.PI],
+    ['vL_spacer.stl',  0,     71.5, -67.7],   // spacer shared L/R
   ],
 };
-const VOSTOK_TUBE = {file: 'vostok_x_tube.stl', len: 500, dz: -71.5, dy: 51.7}; // vs nozzle
+const VOSTOK_TUBE = {file: 'vostok_x_tube.stl', len: 500, dy: 71.5, dz: -51.7}; // vs nozzle (y up, z front)
 const VBUST = Date.now() % 1000000;
 let vostokGeoms = null;
 try {
@@ -741,9 +744,13 @@ try {
     g.setAttribute('normal', new THREE.BufferAttribute(nor, 3));
     return g;
   }
-  async function loadV(file) {
+  async function loadV(file, rotZ) {
     if (!cache[file]) {
       const g = parseBinarySTL(await (await fetch('./' + file + '?b=' + VBUST)).arrayBuffer());
+      // Fusion assembly: X beam, Z UP, Y depth (front = -Y); sim: y up, z front
+      // -> rotateX(-90); optional 180-deg flip for parts modeled facing back
+      if (rotZ) g.rotateZ(rotZ);
+      g.rotateX(-Math.PI/2);
       g.computeBoundingBox();
       const b = g.boundingBox;
       g.translate(-(b.min.x+b.max.x)/2, -(b.min.y+b.max.y)/2, -(b.min.z+b.max.z)/2);
@@ -753,8 +760,8 @@ try {
   }
   vostokGeoms = {L: [], R: [], tube: await loadV(VOSTOK_TUBE.file)};
   for (const k of ['L', 'R'])
-    for (const [f, x, y, z] of VOSTOK_PARTS[k])
-      vostokGeoms[k].push({g: await loadV(f), x, y, z});
+    for (const [f, x, y, z, rz] of VOSTOK_PARTS[k])
+      vostokGeoms[k].push({g: await loadV(f, rz), x, y, z});
   log('vostok STL loaded: real Bereza toolheads + X beam (from Fusion v9.4)', 'info');
 } catch (e) { log('vostok STL failed: ' + e.message, 'warn'); vostokGeoms = null; }
 try {
@@ -949,9 +956,9 @@ function syncScene() {
     // real 20x20x500 tube + MGN9 rail from the model; tube STL is centered,
     // dy/dz measured from the nozzle in the assembly
     if (!railMesh.userData.up) { railMesh.geometry = vostokGeoms.tube; railMesh.userData.up = true; }
-    railMesh.position.set(BED.w/2, M.beam.z + VOSTOK_TUBE.dy, M.beam.y - VOSTOK_TUBE.dz);
+    railMesh.position.set(BED.w/2, M.beam.z + VOSTOK_TUBE.dy, M.beam.y + VOSTOK_TUBE.dz);
     railMesh.visible = true;
-    vRailMesh.position.set(BED.w/2, M.beam.z + VOSTOK_TUBE.dy - 13, M.beam.y - VOSTOK_TUBE.dz);
+    vRailMesh.position.set(BED.w/2, M.beam.z + VOSTOK_TUBE.dy - 13, M.beam.y + VOSTOK_TUBE.dz);
     vRailMesh.visible = true;
   } else {
     rail.visible = true;
