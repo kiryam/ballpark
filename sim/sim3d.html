@@ -38,7 +38,8 @@
   <button id="replayClose" style="background:#b54835;padding:4px 10px;font-size:12px;margin:0">✕</button>
 </div>
 <div id="hud">IDEX: two carriages on one X gantry · inactive one parks · lateral touch by a non-nozzle element = ball moved<br>
-  dots: green=nozzle · orange=PIN · violet=bltouch · red=other · LMB orbit · wheel zoom</div>
+  dots: green=nozzle · orange=PIN · violet=bltouch · red=other · LMB orbit · wheel zoom<br>
+  <b id="hudver"></b></div>
 </div>
 <div class="right">
   <div class="panel">
@@ -404,6 +405,8 @@ function markColor(el) {
   return 0xff5a3d;                                         // red: sock/block/duct
 }
 function mark(wx, wy, z, color) { S.marks.push({wx, wy, z, color, t: S.hist.length}); }
+// console/automation hooks (read-only inspection of the sim state)
+Object.assign(window, {__S: S, __M: M, __markColor: markColor, __HEADS: HEADS});
 // LSQ sphere fit + RANSAC
 function fitSphere(pts) {
   const n = pts.length;
@@ -692,6 +695,11 @@ scene.fog = new THREE.Fog(0x1e222a, 700, 1600);
 const camera = new THREE.PerspectiveCamera(45, view.clientWidth/view.clientHeight, 0.1, 5000);
 camera.position.set(320, 420, 520);
 const controls = new OrbitControls(camera, renderer.domElement);
+// ?cam=close - start near the ball (mark-verification view)
+if (new URLSearchParams(location.search).get('cam') === 'close') {
+  camera.position.set(ball.x + 60, ball.z + 55, ball.y + 90);
+  controls.target.set(ball.x, ball.z, ball.y);
+}
 controls.target.set(BED.w/2, 45, BED.h/2);
 controls.enableDamping = true;
 scene.add(new THREE.AmbientLight(0xffffff, 0.6));
@@ -756,7 +764,9 @@ const VOSTOK_PARTS = {
   ],
 };
 const VOSTOK_TUBE = {file: 'vostok_x_tube.stl', len: 500, dy: 71.5, dz: -51.7}; // vs nozzle (y up, z front)
+const SIM_VER = 'v79';
 const VBUST = Date.now() % 1000000;
+document.getElementById('hudver').textContent = SIM_VER + ' (green dot = a click the physics engine attributed to the NOZZLE disc at the head origin; if the mesh visibly disagrees, the STL placement is wrong - report it)';
 let vostokGeoms = null;
 try {
   const cache = {};
@@ -896,6 +906,12 @@ function buildHead(isB) {
     // tiny nozzle cone at the origin (the STLs are body-level detail)
     const nz = new THREE.Mesh(new THREE.ConeGeometry(1.2, 4, 12), mat(0xc8a8d0));
     nz.rotation.x = Math.PI; nz.position.y = 2; g.add(nz);
+    // the decoy pin is a PHYSICS-only element on vostok (no STL part) -
+    // render a visible needle so pin clicks are attributable on screen
+    if (!isB && document.getElementById('pin').checked) {
+      const pin = new THREE.Mesh(new THREE.CylinderGeometry(0.6, 0.6, 4, 8), mat(0xff9500));
+      pin.position.set(-6, PIN_ZP + 2, -4); g.add(pin);
+    }
     g.userData.fans = [];
     return g;
   }
