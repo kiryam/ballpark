@@ -133,6 +133,7 @@ let rng = Math.random;
 function mulberry32(a) { return function() { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
 // HEADS: 'vostok' (real Bereza geometry measured from the Fusion model) or 'sb'
 const HEADS = new URLSearchParams(location.search).get('heads') || 'vostok';
+const PIN_ZP = +(new URLSearchParams(location.search).get('zp') ?? (location.search.includes('test=pin') ? 0 : 1));
 function els(headB) {
   const d = headB ? geo.bl : 0;
   if (HEADS === 'vostok') {
@@ -141,13 +142,17 @@ function els(headB) {
     // printable toolhead); the part-cooling ducts are narrow tubes BESIDE
     // and BEHIND it (dx -17 and -27), a little higher - side traps like
     // the StealthBurner ducts, so the proven escape logic applies.
-    return [
+    const e0 = [
       {name:'nozzle', dx:0, dy:0, r:0.4, zo:0},
       {name:'sock', dx:0, dy:0, r:6, zo:1.5 + d},
       {name:'block', dx:0, dy:0, r:11, zo:4.5 + d},
       {name:'duct tube 1', dx:-17, dy:2, r:4.5, zo:1.2 + d},
       {name:'duct tube 2', dx:-27, dy:2, r:4, zo:1.8 + d},
     ];
+    const pin = document.getElementById('pin');
+    if (!headB && pin && pin.checked)
+      e0.push({name:'pin', dx:-6, dy:4, r:0.6, zo: PIN_ZP + d});
+    return e0;
   }
   const e = [
     {name:'nozzle', dx:0, dy:0, r:0.4, zo:0},
@@ -594,7 +599,15 @@ function* algoSphere() {
         } else { log('verify failed - falling back to best click', 'bad'); fit = null; }
       } else { log('verify failed - falling back to best click', 'bad'); fit = null; }
     }
-    if (!fit) apex = {x: best.x, y: best.y, z: best.z};
+    if (!fit) {
+      // the apex may ONLY be a nozzle click - a foreign-element click
+      // (the decoy pin!) must never become the center
+      const bestNz = samples().filter(t => t.el === 'nozzle')
+        .reduce((a, t) => (!a || t.z > a.z) ? t : a, null);
+      if (bestNz) apex = {x: bestNz.x, y: bestNz.y, z: bestNz.z};
+      else { apex = {x: best.x, y: best.y, z: best.z}; S.foreignApex = true;
+             log('!! no nozzle click at all - apex taken from a foreign element', 0); }
+    }
     if (head === 'A' && stage === 0) {
       S.apexA = apex;
       log(`Apex (head A): X${apex.x.toFixed(2)} Y${apex.y.toFixed(2)} Z${apex.z.toFixed(2)}`, 'good');
@@ -1014,7 +1027,7 @@ function resetRun() {
   M.active = 'A'; M.cur = null; M.lastProbe = null;
   M.clicks = 0; M.bad = 0; M.dist = 0; M.ballMoves = 0;
   S.logbuf = []; S.marks = []; S.pathA = []; S.pathB = [];
-  S.apexA = null; S.apexB = null; S.eoff = null; S.eoffErr = null;
+  S.apexA = null; S.apexB = null; S.eoff = null; S.eoffErr = null; S.foreignApex = false;
   document.getElementById('log').innerHTML = '';
   trailA.geometry = new THREE.BufferGeometry(); trailB.geometry = new THREE.BufferGeometry();
 }
@@ -1039,7 +1052,7 @@ function finishRun() {
   S.running = false;
   const e = S.eoffErr;
   if (e) {
-    S.status = (Math.abs(e.dx)<0.5 && Math.abs(e.dy)<0.5 && Math.abs(e.dz)<0.5 && M.ballMoves === 0) ? '✅ calibrated' : (M.ballMoves > 0 ? '❌ ball moved!' : '❌ offset off');
+    S.status = (Math.abs(e.dx)<0.5 && Math.abs(e.dy)<0.5 && Math.abs(e.dz)<0.5 && M.ballMoves === 0 && !S.foreignApex) ? '✅ calibrated' : (M.ballMoves > 0 ? '❌ ball moved!' : (S.foreignApex ? '❌ foreign apex!' : '❌ offset off'));
     document.getElementById('m_xy').textContent = Math.hypot(e.dx, e.dy).toFixed(2)+' mm';
     document.getElementById('m_z').textContent = e.dz.toFixed(2)+' mm';
   } else S.status = 'not found';
@@ -1130,6 +1143,7 @@ document.getElementById('batch').onclick = () => {
 // ?test=grid[&reps&noise&seed] / ?test=single&bx&by&seed
 const pm = name => { const m = location.search.match(new RegExp('[?&]'+name+'=([^&]+)')); return m ? m[1] : null; };
 if (pm('noise')) document.getElementById('noise').checked = true;
+if (location.search.includes('test=pin')) document.getElementById('pin').checked = true;
 if (pm('pin') === '0') document.getElementById('pin').checked = false;
 // world parameters from URL (stress tests):
 //   br=<ball radius> pre=<lever pre-travel, Z> jit=<X/Y slop> bump=<ball bump at T1> np=<noise %>
@@ -1148,13 +1162,20 @@ for (const [p, id] of [['nbx','nbx'],['nby','nby'],['nbz','nbz']]) {
 }
 const seedm = pm('seed');
 if (seedm !== null) rng = mulberry32(+seedm || 1);
-if (location.search.includes('test=grid') || location.search.includes('test=single')) {
+if (location.search.includes('test=grid') || location.search.includes('test=single') || location.search.includes('test=pin')) {
   // grid over the zone reachable by both carriage nozzles
-  const xs = [110, 155, 200, 245, 290], ys = [50, 100, 150, 200];
-  const holes = [[132,75],[177,125],[222,175]];
-  const poses = [];
-  for (const gx of xs) for (const gy of ys) poses.push([gx, gy]);
-  for (const h of holes) poses.push(h);
+  let poses;
+  if (location.search.includes('test=pin')) {
+    // decoy-pin stress (pin forced ON at nozzle height, zp=0): positions
+    // where the pin (dx -6,+4 from the nozzle) lands near click zones
+    poses = [[155,100],[200,150],[245,100],[177,125],[132,75],[200,50],[155,175]];
+  } else {
+    const xs = [110, 155, 200, 245, 290], ys = [50, 100, 150, 200];
+    const holes = [[132,75],[177,125],[222,175]];
+    poses = [];
+    for (const gx of xs) for (const gy of ys) poses.push([gx, gy]);
+    for (const h of holes) poses.push(h);
+  }
   const master = +(pm('seed') || 1);
   const poseSeed = p => master*7919 + p[0]*131 + p[1]*17;
   setTimeout(() => {
@@ -1180,18 +1201,26 @@ if (location.search.includes('test=grid') || location.search.includes('test=sing
           rng = mulberry32(poseSeed(p) + rep*104729);
           ball.x = p[0]; ball.y = p[1];
           runOne();
-          const r = {pos:`(${p[0]},${p[1]})`, ok: !!(S.eoffErr && Math.abs(S.eoffErr.dx)<0.5 && Math.abs(S.eoffErr.dy)<0.5 && Math.abs(S.eoffErr.dz)<0.5 && M.ballMoves === 0),
+          // apex-vs-truth: each head's apex must sit on the ball center in
+          // its own frame - catches "centered on the decoy pin" even when
+          // the offset error happens to cancel out
+          const tA = {x: ball.x - nA.x, y: ball.y - nA.y, z: BALL_CZ + BALL_R - nA.z};
+          const tB = {x: ball.x - nB.x, y: ball.y - nB.y, z: BALL_CZ + BALL_R - nB.z};
+          const axA = Math.max(Math.hypot(S.apexA.x-tA.x, S.apexA.y-tA.y), Math.abs(S.apexA.z-tA.z));
+          const axB = Math.max(Math.hypot(S.apexB.x-tB.x, S.apexB.y-tB.y), Math.abs(S.apexB.z-tB.z));
+          const r = {pos:`(${p[0]},${p[1]})`, ok: !!(S.eoffErr && Math.abs(S.eoffErr.dx)<0.5 && Math.abs(S.eoffErr.dy)<0.5 && Math.abs(S.eoffErr.dz)<0.5 && M.ballMoves === 0 && !S.foreignApex && axA < 0.5 && axB < 0.5),
             exy: S.eoffErr ? Math.hypot(S.eoffErr.dx, S.eoffErr.dy) : NaN,
             ez: S.eoffErr ? Math.abs(S.eoffErr.dz) : NaN,
-            clicks: M.clicks, bad: M.bad, dist: M.dist, mv: M.ballMoves};
+            clicks: M.clicks, bad: M.bad, dist: M.dist, mv: M.ballMoves,
+            axA, axB};
           all.push(r);
-          rows.push(`${r.ok?'✓':'✗'} ${r.pos} XY${isNaN(r.exy)?'-':r.exy.toFixed(3)} Z${isNaN(r.ez)?'-':r.ez.toFixed(3)} cl${r.clicks} bad${r.bad} mv${r.mv} path${Math.round(r.dist)}mm`);
+          rows.push(`${r.ok?'✓':'✗'} ${r.pos} XY${isNaN(r.exy)?'-':r.exy.toFixed(3)} Z${isNaN(r.ez)?'-':r.ez.toFixed(3)} cl${r.clicks} bad${r.bad} mv${r.mv} axA${axA.toFixed(2)} axB${axB.toFixed(2)}${S.foreignApex?' FOREIGN!':''} path${Math.round(r.dist)}mm`);
           if (!r.ok) rows.push('--- failure log ---\n' + S.logbuf.join('\n'));
           else S.logbuf = [];
         }
       const oks = all.filter(r=>r.ok);
       const med = a => a.length ? a.slice().sort((x,y)=>x-y)[Math.floor(a.length/2)] : NaN;
-      const sum = `GRID3D [sphere${M.noise?'+noise':''}]: ${oks.length}/${all.length} ok | medXY ${med(oks.map(r=>r.exy)).toFixed(3)} medZ ${med(oks.map(r=>r.ez)).toFixed(3)} | cl med${Math.round(med(all.map(r=>r.clicks)))} | moves ${all.reduce((s,r)=>s+r.mv,0)} | path med${Math.round(med(all.map(r=>r.dist)))}mm`;
+      const sum = `GRID3D [sphere${M.noise?'+noise':''}${location.search.includes('test=pin')?'+pin@0':''}]: ${oks.length}/${all.length} ok | medXY ${med(oks.map(r=>r.exy)).toFixed(3)} medZ ${med(oks.map(r=>r.ez)).toFixed(3)} | cl med${Math.round(med(all.map(r=>r.clicks)))} | moves ${all.reduce((s,r)=>s+r.mv,0)} | path med${Math.round(med(all.map(r=>r.dist)))}mm`;
       log(sum, oks.length===all.length?'good':'bad');
       document.getElementById('batchout').textContent = sum + '\n' + rows.join('\n');
       document.title = 'GRID3D: ' + sum;
