@@ -32,7 +32,12 @@
 </head>
 <body>
 <div id="view">
-  <div id="hud">IDEX: two carriages on one X gantry · inactive one parks · lateral touch by a non-nozzle element = ball moved<br>
+  <div id="replaybar" style="position:absolute;left:10px;right:10px;bottom:8px;display:none;align-items:center;gap:8px;background:rgba(20,23,29,.8);padding:6px 10px;border-radius:8px">
+  <span style="font-size:12px;color:#9fb3d1;white-space:nowrap">⟲ история</span>
+  <input type="range" id="replay" min="0" max="0" value="0" step="1" style="flex:1">
+  <button id="replayClose" style="background:#b54835;padding:4px 10px;font-size:12px;margin:0">✕</button>
+</div>
+<div id="hud">IDEX: two carriages on one X gantry · inactive one parks · lateral touch by a non-nozzle element = ball moved<br>
   LMB — orbit · wheel — zoom · drag the ball with the mouse</div>
 </div>
 <div class="right">
@@ -315,6 +320,7 @@ const M = {
       this.dist += Math.max(0, pos.z - res.z);
       this.beam.z = Math.max(res.z, c.fz);
       this.lastProbe = res;
+      if (S.running) recordHist();
       return true;
     }
     // moves and lateral probing: sub-steps with accumulated progress
@@ -356,13 +362,14 @@ const M = {
       } else prevGap = g.gap;
     }
     if (c.kind === 'probe') this.lastProbe = {triggered: false, x: this.pos().x, y: this.pos().y, z: this.pos().z};
+    if (S.running) recordHist();
     return done >= len - 1e-9;
   }
 };
 // =====================================================================
 //  State + log
 // =====================================================================
-const S = {running: false, fast: false, gen: null, status: 'idle',
+const S = {running: false, fast: false, gen: null, status: 'idle', hist: [], replayT: null,
   logbuf: [], apexA: null, apexB: null, eoff: null, eoffErr: null,
   marks: [], pathA: [], pathB: []};
 function log(msg, cls='info') {
@@ -950,6 +957,17 @@ const trailA = new THREE.Line(new THREE.BufferGeometry(), new THREE.LineBasicMat
 const trailB = new THREE.Line(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({color: 0x6aa8ff, transparent: true, opacity: .45}));
 scene.add(trailA, trailB);
 const marksGroup = new THREE.Group(); scene.add(marksGroup);
+function recordHist() {
+  // motion history: both carriages whenever either moves (throttled so
+  // idle frames do not flood the replay); called from M.step so fast
+  // (batch/grid) runs record too
+  const a = M.carr.A, b = M.carr.B, bz = M.beam.z, by = M.beam.y;
+  const last = S.hist[S.hist.length - 1];
+  if (!last || Math.abs(last.a - a) > 0.15 || Math.abs(last.b - b) > 0.15
+      || Math.abs(last.bz - bz) > 0.15 || Math.abs(last.by - by) > 0.15)
+    S.hist.push({a, b, bz, by});
+    if (S.hist.length > 60000) S.hist.shift();
+}
 function syncScene() {
   ballMesh.position.set(ball.x, BALL_CZ, ball.y);
   // rotors spin fast on the ACTIVE head while a run is in progress
@@ -991,6 +1009,7 @@ function syncScene() {
   while (marksGroup.children.length < S.marks.length) {
     marksGroup.add(new THREE.Mesh(new THREE.SphereGeometry(0.9, 8, 6), new THREE.MeshBasicMaterial()));
   }
+  marksGroup.children.forEach((m, i) => { m.visible = i < S.marks.length; });
   S.marks.forEach((mk, i) => {
     const m = marksGroup.children[i];
     m.position.set(mk.wx, mk.z, mk.wy);
@@ -1002,6 +1021,26 @@ addEventListener('resize', () => {
   camera.updateProjectionMatrix();
   renderer.setSize(view.clientWidth, view.clientHeight);
 });
+// ---- replay slider: scrub the recorded motion history ----
+const replayBar = document.getElementById('replaybar');
+const replayEl = document.getElementById('replay');
+function updateReplaySlider() {
+  if (typeof replayEl === 'undefined' || !replayEl) return;
+  replayEl.max = Math.max(0, S.hist.length - 1);
+  replayEl.value = replayEl.max;
+  replayBar.style.display = (S.hist.length > 1 && !S.running) ? 'flex' : 'none';
+}
+replayEl.addEventListener('input', () => {
+  if (S.running || !S.hist.length) return;
+  const h = S.hist[+replayEl.value];
+  if (!h) return;
+  M.carr.A = h.a; M.carr.B = h.b; M.beam.z = h.bz; M.beam.y = h.by;
+});
+document.getElementById('replayClose').onclick = () => {
+  replayBar.style.display = 'none';
+  const h = S.hist[S.hist.length - 1];
+  if (h) { M.carr.A = h.a; M.carr.B = h.b; M.beam.z = h.bz; M.beam.y = h.by; }
+};
 // ball dragging
 const ray = new THREE.Raycaster(), mouseV = new THREE.Vector2();
 let dragging = false;
@@ -1028,16 +1067,19 @@ function resetRun() {
   M.clicks = 0; M.bad = 0; M.dist = 0; M.ballMoves = 0;
   S.logbuf = []; S.marks = []; S.pathA = []; S.pathB = [];
   S.apexA = null; S.apexB = null; S.eoff = null; S.eoffErr = null; S.foreignApex = false;
+  S.hist = []; if (typeof updateReplaySlider === 'function') updateReplaySlider();
   document.getElementById('log').innerHTML = '';
   trailA.geometry = new THREE.BufferGeometry(); trailB.geometry = new THREE.BufferGeometry();
 }
 function startRun(seedPos) {
   resetRun();
+  S.hist = [];
   if (seedPos) { ball.x = seedPos[0]; ball.y = seedPos[1]; }
   randToolOffsets();
   M.noise = document.getElementById('noise').checked;
   scene.remove(headMeshA); headMeshA = buildHead(false); scene.add(headMeshA);
   S.running = true; S.status = 'running';
+  replayBar.style.display = 'none';
   S.gen = algoSphere();
   pump(S.gen.next());
   updMetrics();
@@ -1070,6 +1112,7 @@ function finishRun() {
       el.style.color = eOK ? '#7fd47f' : '#ff8f7a';
     }
   }
+  updateReplaySlider();
   updMetrics();
   log(`=== RESULT: ${S.status} (ball moves ${M.ballMoves}) ===`, S.status.startsWith('✅') ? 'good' : 'bad');
   if (S.onDone) { const f = S.onDone; S.onDone = null; f(); }
