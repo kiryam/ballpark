@@ -1,0 +1,1041 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Симулятор поиска шарика соплом</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 0; background: #1e222a; color: #dfe3ea; display: flex; flex-direction: column; height: 100vh; }
+  header { padding: 8px 14px; background: #14171d; font-size: 15px; }
+  .row { display: flex; flex: 1; min-height: 0; }
+  .left { flex: 1; display: flex; flex-direction: column; padding: 8px; gap: 8px; min-width: 0; }
+  .right { width: 340px; overflow-y: auto; padding: 8px; background: #181c23; }
+  canvas { background: #262b35; border-radius: 8px; width: 100%; }
+  #top { flex: 1; } #side { height: 190px; }
+  .panel { background: #20252e; border-radius: 8px; padding: 10px; margin-bottom: 10px; }
+  .panel h3 { margin: 0 0 8px; font-size: 13px; color: #9fb3d1; text-transform: uppercase; letter-spacing: .5px; }
+  label { display: block; font-size: 12px; margin: 6px 0 2px; color: #aab4c4; }
+  input[type=range] { width: 100%; }
+  .val { float: right; color: #7fbf7f; font-variant-numeric: tabular-nums; }
+  button { background: #3565b5; border: 0; color: #fff; padding: 8px 14px; border-radius: 6px; font-size: 14px; cursor: pointer; margin-right: 6px; margin-top: 4px; }
+  button.stop { background: #b54835; }
+  button.batch { background: #3a8a5a; }
+  select, input[type=checkbox] { font-size: 13px; }
+  #metrics { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; font-size: 13px; }
+  #metrics div { background: #141820; padding: 6px 8px; border-radius: 6px; }
+  #metrics b { color: #ffd479; }
+  #log { font-family: ui-monospace, monospace; font-size: 11px; height: 200px; overflow-y: auto; background: #141820; border-radius: 6px; padding: 6px; }
+  .good { color: #7fd47f; } .bad { color: #ff8f7a; } .info { color: #9fb3d1; } .warn { color: #ffd479; }
+  .hint { font-size: 11px; color: #77839a; margin-top: 4px; }
+  #batch { font-family: ui-monospace, monospace; font-size: 11px; white-space: pre; margin-top: 6px; }
+</style>
+</head>
+<body>
+<header>🔵 Симулятор — шарик где угодно, старт фиксированный. Низ: вид сбоку — зелёные точки = касание соплом, красные = чужим элементом</header>
+<div class="row">
+  <div class="left">
+    <canvas id="top"></canvas>
+    <canvas id="side"></canvas>
+  </div>
+  <div class="right">
+    <div class="panel">
+      <h3>Запуск</h3>
+      <select id="algo">
+        <option value="waterline">1. Ватерлиния (кольца сверху вниз)</option>
+        <option value="raster">2. Растр по максимуму клика</option>
+        <option value="sphere">3. Сфера v2: восхождение + кольца + МНК/RANSAC</option>
+        <option value="hill">4. Восхождение по высоте клика</option>
+      </select>
+      <label>Скорость анимации <span class="val" id="v_speed"></span></label>
+      <input type="range" id="speed" min="1" max="120" value="25">
+      <div style="margin-top:8px">
+        <button id="run">▶ Пуск</button>
+        <button id="batch" class="batch">⏩ Серия ×15</button>
+        <button id="reset" class="stop">↺ Сброс</button>
+      </div>
+      <div class="hint">«Серия» — 15 прогонов со случайными позициями шарика, мгновенно, со сводкой в лог.</div>
+    </div>
+    <div class="panel">
+      <h3>Метрики прогона</h3>
+      <div id="metrics">
+        <div>Ошибка XY: <b id="m_xy">—</b></div>
+        <div>Ошибка Z: <b id="m_z">—</b></div>
+        <div>Кликов всего: <b id="m_clicks">0</b></div>
+        <div>Плохих (не соплом): <b id="m_bad">0</b></div>
+        <div>Пройдено пути, мм: <b id="m_dist">0</b></div>
+        <div>Статус: <b id="m_st">ожидание</b></div>
+      </div>
+    </div>
+    <div class="panel">
+      <h3>Голова (геометрия)</h3>
+      <label>Блок нагревателя: радиус <span class="val" id="v_rb"></span></label>
+      <input type="range" id="rb" min="6" max="16" step="0.5" value="11">
+      <label>Блок: выше сопла на <span class="val" id="v_zb"></span></label>
+      <input type="range" id="zb" min="2" max="10" step="0.5" value="4.5">
+      <label>Воздуховоды: вынос от оси <span class="val" id="v_dd"></span></label>
+      <input type="range" id="dd" min="8" max="24" step="1" value="15">
+      <label>Воздуховоды: выше сопла на <span class="val" id="v_zd"></span></label>
+      <input type="range" id="zd" min="0" max="8" step="0.25" value="2.5">
+      <label>Чехол: радиус <span class="val" id="v_rs"></span></label>
+      <input type="range" id="rs" min="3" max="10" step="0.5" value="6">
+      <label>Чехол: выше сопла на <span class="val" id="v_zs"></span></label>
+      <input type="range" id="zs" min="0" max="6" step="0.25" value="1.5">
+      <label>Штифт-обманка (у A): выше сопла на <span class="val" id="v_zp"></span></label>
+      <input type="range" id="zp" min="0" max="4" step="0.25" value="1">
+      <label><input type="checkbox" id="pin" checked> Штифт-обманка включён («псевдосопло» сбоку)</label>
+      <label>Правая голова B: элементы ниже на <span class="val" id="v_bl"></span></label>
+      <input type="range" id="bl" min="0" max="3" step="0.25" value="1.5">
+    </div>
+    <div class="panel">
+      <h3>Алгоритм</h3>
+      <label>Шаг ватерлинии δ, мм <span class="val" id="v_wl"></span></label>
+      <input type="range" id="wl" min="0.1" max="1" step="0.1" value="0.4">
+      <label>Радиус обходов, мм <span class="val" id="v_wr"></span></label>
+      <input type="range" id="wr" min="10" max="28" step="1" value="24">
+      <label>Шаг сетки растра, мм <span class="val" id="v_gs"></span></label>
+      <input type="range" id="gs" min="1" max="6" step="0.5" value="3">
+      <label><input type="checkbox" id="noise"> Шум провода (ложные клики 3%)</label>
+      <label><input type="checkbox" id="keepoff"> Фиксировать истинный офсет между прогонами</label>
+    </div>
+    <div class="panel">
+      <h3>G-код (что исполняет симуляция)</h3>
+      <div id="gmon" style="font-family:ui-monospace,monospace;font-size:11px;background:#141820;border-radius:6px;padding:6px;height:110px;overflow-y:auto;color:#9fd0ff"></div>
+      <label>Своя программа (G0 X Y Z, G38.2 Z<x> - нажать вниз до x, G38.2 X.. Y.. - обход, M117):</label>
+      <textarea id="gcode" rows="4" style="width:100%;font-family:ui-monospace,monospace;font-size:11px;background:#141820;color:#dfe3ea;border:1px solid #313845;border-radius:6px;padding:4px">G0 X55 Y40 Z60
+M117 иду к шарику
+G0 X70 Y50
+G38.2 Z45</textarea>
+      <button id="rung" style="margin-top:6px">▶ Выполнить G-код</button>
+    </div>
+    <div class="panel">
+      <h3>Лог</h3>
+      <div id="log"></div>
+      <div id="batchout"></div>
+    </div>
+  </div>
+</div>
+<script>
+'use strict';
+// ---------------- Модель мира ----------------
+const BED = {w: 110, h: 80};
+const ball = {x: 55, y: 40, r: 5, top: 49.5};
+const START = {x: 55, y: 40};   // фиксированная стартовая точка, симуляция НЕ знает где шарик
+const headA = {x: 55, y: 40, z: 60, tag: 'A'};
+const headB = {x: 55, y: 40, z: 60, tag: 'B'};
+const geo = {rb: 11, zb: 4.5, dd: 15, zd: 2.5, rs: 6, zs: 1.5, zp: 1, bl: 1.5};
+// Истинное смещение системы координат головы B (неизвестно алгоритмам):
+// команда B "иди в X" физически ставит её сопло в X+ox, Y+oy, Z+oz.
+const off = {x: 0, y: 0, z: 0};
+let rng = Math.random;
+function mulberry32(a) { return function() { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+function randOff() {
+  off.x = 5 + rng()*7;      // ~офсет каретки
+  off.y = -3 + rng()*6;
+  off.z = -0.4 + rng()*0.8;
+}
+function els(h) {
+  const d = h === headB ? geo.bl : 0;  // у B всё торчащее ниже на bl
+  const e = [
+    {name:'сопло', dx:0, dy:0, r:0.4, zo:0},
+    {name:'чехол', dx:0, dy:0, r:geo.rs, zo:geo.zs + d},
+    {name:'блок', dx:0, dy:0, r:geo.rb, zo:geo.zb + d},
+    {name:'воздуховод L', dx:-geo.dd, dy:0, r:4, zo:geo.zd + d},
+    {name:'воздуховод R', dx:+geo.dd, dy:0, r:4, zo:geo.zd + d},
+  ];
+  if (h !== headB && document.getElementById('pin').checked)
+    e.push({name:'штифт', dx:-6, dy:4, r:0.6, zo:geo.zp});
+  return e;
+}
+// мировая позиция сопла головы
+function wpos(h) {
+  return h === headB ? {x: h.x + off.x, y: h.y + off.y, z: h.z + off.z} : {x: h.x, y: h.y, z: h.z};
+}
+function surf(x, y) {
+  const d2 = (x-ball.x)**2 + (y-ball.y)**2;
+  if (d2 >= ball.r*ball.r) return -Infinity;
+  return ball.top - (ball.r - Math.sqrt(ball.r*ball.r - d2));
+}
+function press(x, y, h) {
+  h = h || S.active;
+  const w = wpos(h);
+  const zo = h === headB ? off.z : 0;
+  let best = null;
+  for (const e of els(h)) {
+    // сопло - точка (r<0.5): сэмпл только центра; кольцевой сэмпл давал ложные
+    // «краевые» касания с завышением Z до 0.7мм и порчу сферы (R=5.64 вместо 5)
+    let s = surf(w.x+e.dx, w.y+e.dy);
+    if (e.r >= 0.5) {
+      const rr = e.r;
+      for (let a = 0; a < 12; a++) {
+        const px = w.x + e.dx + rr*Math.cos(a/12*2*Math.PI);
+        const py = w.y + e.dy + rr*Math.sin(a/12*2*Math.PI);
+        s = Math.max(s, surf(px, py));
+      }
+    }
+    const z = s - e.zo - zo;
+    if (s > -Infinity && (!best || z > best.z)) best = {z, el: e.name};
+  }
+  return best;
+}
+function sweep(x1, y1, x2, y2, H, h) {
+  h = h || S.active;
+  const w = wpos(h);
+  const zo = h === headB ? off.z : 0;
+  const n = Math.max(2, Math.floor(Math.hypot(x2-x1, y2-y1) / 0.25));
+  for (let i = 0; i <= n; i++) {
+    const t = i/n;
+    const wxc = w.x+(x2-x1)*t, wyc = w.y+(y2-y1)*t;
+    for (const e of els(h)) {
+      let s = surf(wxc+e.dx, wyc+e.dy);
+      const rr = e.r*0.85;
+      s = Math.max(s, surf(wxc+e.dx+rr, wyc+e.dy), surf(wxc+e.dx-rr, wyc+e.dy),
+                   surf(wxc+e.dx, wyc+e.dy+rr), surf(wxc+e.dx, wyc+e.dy-rr));
+      if (s - e.zo - zo >= H) return {x: x1+(x2-x1)*t, y: y1+(y2-y1)*t, el: e.name};
+    }
+  }
+  return null;
+}
+// ---------------- Состояние ----------------
+const S = {
+  running: false, clicks: 0, bad: 0, dist: 0, marks: [], path: [],
+  result: null, queue: [], status: 'ожидание', noise: false, algo: 'waterline',
+  bestClick: null, samples: [], fast: false, onDone: null, retry: 0,
+  active: null, apexA: null, apexB: null, measuredOff: null, stage: 0, logbuf: [],
+};
+function log(msg, cls='info') {
+  S.logbuf.push(msg);
+  if (S.logbuf.length > 4000) S.logbuf.shift();
+  const d = document.createElement('div');
+  d.className = cls; d.textContent = msg;
+  const L = document.getElementById('log');
+  L.prepend(d);
+  while (L.children.length > 250) L.lastChild.remove();
+}
+function mark(x, y, good, z) { S.marks.push({x, y, good, z}); }
+function clx(x) { return Math.max(8, Math.min(BED.w-8, x)); }
+function cly(y) { return Math.max(8, Math.min(BED.h-8, y)); }
+function maybeNoise() { return S.noise && rng() < 0.03; }
+function mv(x, y, z, tag) {
+  const g = ['G0'];
+  if (x !== null && x !== undefined) g.push('X' + x.toFixed(1));
+  if (y !== null && y !== undefined) g.push('Y' + y.toFixed(1));
+  if (z !== null && z !== undefined) g.push('Z' + z.toFixed(1));
+  S.queue.push({type:'mv', x, y, z, tag, g: g.join(' ')});
+}
+function doTravel(x, y, z, tag) {
+  // безопасный переход: вверх -> бок -> вниз (никогда не режем через шарик)
+  S.queue.push({type:'travel', x, y, z, tag,
+    g: `G0 Z60 ; безопасный переход`});
+}
+function doPress(x, y, tag, bid) { S.queue.push({type:'press', x, y, tag, bid,
+  g: `G38.2 Z39 ; нажим в X${x.toFixed(1)} Y${y.toFixed(1)}`}); }
+function doSweep(x1, y1, x2, y2, H, tag) { S.queue.push({type:'sweep', x1, y1, x2, y2, H, tag, g: `G38.2 X${x2.toFixed(1)} Y${y2.toFixed(1)} ; обход H=${H.toFixed(1)}`}); }
+function finish(res) { S.queue.push({type:'done', res, g: '; готово'}); }
+function gmon(line, cur) {
+  const el = document.getElementById('gmon');
+  if (!el) return;
+  if (line !== null) { el._lines = (el._lines || []).concat([line]).slice(-14); }
+  el._cur = cur === undefined ? null : cur;
+  el.innerHTML = ((el._lines || []).concat(el._cur ? ['<b>' + el._cur + '</b>'] : [])).join('<br>');
+}
+// ---------------- Фаза 1: слепой поиск шарика ----------------
+function scanPhase() {
+  // шаг адаптивен к «радиусу слуха» блока (rb + Rшара): худший промах узел→шарик
+  // = шаг/√2 должен быть меньше радиуса слуха, иначе дыры покрытия
+  const hear = geo.rb + ball.r;
+  const pitch = Math.max(8, Math.min(20, Math.floor(hear * 1.35)));
+  const xs = [], ys = [];
+  for (let x = 12; x <= BED.w - 8; x += pitch) xs.push(Math.round(x));
+  for (let y = 12; y <= BED.h - 8; y += pitch) ys.push(Math.round(y));
+  const pts = [];
+  for (const x of xs) for (const y of ys) pts.push([x, y]);
+  pts.sort((a,b)=>Math.hypot(a[0]-START.x,a[1]-START.y)-Math.hypot(b[0]-START.x,b[1]-START.y));
+  for (const [x, y] of pts) { doTravel(x, y, 60); doPress(x, y, 'scan'); }
+}
+// ---------------- Фаза 2: алгоритмы ----------------
+function wlRadii() { const R = +document.getElementById('wr').value; return [R*0.05, R*0.15, R*0.3, R*0.5, R*0.75, R]; }
+function enqueueWaterline(b) {
+  const dH = +document.getElementById('wl').value;
+  let H = b.z + geo.zb + geo.bl + 1.0;
+  const levels = [];
+  while (H > b.z - geo.zb - geo.bl - 2) { levels.push(H); H -= dH; }
+  log(`ватерлиния: старт Z${levels[0].toFixed(1)}, уровней ${levels.length}`);
+  for (const h of levels) {
+    for (const rr of wlRadii()) {
+      doTravel(b.x + rr, b.y, h);
+      let px = b.x + rr, py = b.y;
+      for (let k = 1; k <= 8; k++) {
+        const a = k/8*2*Math.PI;
+        const nx = b.x + rr*Math.cos(a), ny = b.y + rr*Math.sin(a);
+        doSweep(px, py, nx, ny, h, `H=${h.toFixed(1)}`);
+        px = nx; py = ny;
+      }
+    }
+    S.queue.push({type:'wllevel', H: h});
+  }
+}
+function buildPhase2() {
+  const b = S.bestClick;
+  if (!b) { finish(null); return; }
+  if (S.algo === 'waterline') {
+    enqueueWaterline(b);
+  } else if (S.algo === 'raster') {
+    const step = +document.getElementById('gs').value;
+    for (let dx = -9; dx <= 9; dx += step)
+      for (let dy = -9; dy <= 9; dy += step) {
+        doTravel(b.x+dx, b.y+dy, 60); doPress(b.x+dx, b.y+dy);
+      }
+    finish({algo:'raster'});
+  } else if (S.algo === 'sphere') {
+    // v2: восхождение по высоте с сжатием шага; при застревании (ловушка воздуховодов) -
+    // кольца побега; затем два кольца точек сферы -> МНК+RANSAC -> верификация соплом в центре
+    S.queue.push({type:'hstep', x: b.x, y: b.y, z: b.z, d: 4});
+  } else if (S.algo === 'hill') {
+    S.queue.push({type:'hillstep', x: b.x, y: b.y, z: b.z, d: 4});
+  }
+}
+// МНК-сфера (Коса): точки -> центр и радиус
+function fitSphere(pts) {
+  const n = pts.length;
+  if (n < 4) return null;
+  const A = [], bv = [];
+  for (const p of pts) {
+    A.push([2*p.x, 2*p.y, 2*p.z, 1]);
+    bv.push(p.x*p.x + p.y*p.y + p.z*p.z);
+  }
+  const M = [[0,0,0,0,0],[0,0,0,0,0],[0,0,0,0,0],[0,0,0,0,0]];
+  for (let i = 0; i < 4; i++) {
+    for (let j = 0; j < 4; j++) {
+      let s = 0;
+      for (let k = 0; k < n; k++) s += A[k][i]*A[k][j];
+      M[i][j] = s;
+    }
+    let s = 0;
+    for (let k = 0; k < n; k++) s += A[k][i]*bv[k];
+    M[i][4] = s;
+  }
+  for (let col = 0; col < 4; col++) {
+    let piv = col;
+    for (let r2 = col+1; r2 < 4; r2++) if (Math.abs(M[r2][col]) > Math.abs(M[piv][col])) piv = r2;
+    [M[col], M[piv]] = [M[piv], M[col]];
+    if (Math.abs(M[col][col]) < 1e-9) return null;
+    for (let r2 = col+1; r2 < 4; r2++) {
+      const f = M[r2][col]/M[col][col];
+      for (let c2 = col; c2 < 5; c2++) M[r2][c2] -= f*M[col][c2];
+    }
+  }
+  const sol = [0,0,0,0];
+  for (let r2 = 3; r2 >= 0; r2--) {
+    let s = M[r2][4];
+    for (let c2 = r2+1; c2 < 4; c2++) s -= M[r2][c2]*sol[c2];
+    sol[r2] = s/M[r2][r2];
+  }
+  const cx = sol[0], cy = sol[1], cz = sol[2];
+  const r2 = sol[3] + cx*cx + cy*cy + cz*cz;
+  if (r2 <= 0) return null;
+  return {cx, cy, cz, r: Math.sqrt(r2)};
+}
+function resid(p, f) { return Math.abs(Math.hypot(p.x-f.cx, p.y-f.cy, p.z-f.cz) - f.r); }
+function sphereRANSAC(pts) {
+  if (pts.length < 4) return null;
+  let bestSet = null, bestCount = -1;
+  for (let it = 0; it < 80; it++) {
+    const idx = [];
+    while (idx.length < 4) {
+      const i = Math.floor(Math.random()*pts.length);
+      if (!idx.includes(i)) idx.push(i);
+    }
+    const f = fitSphere(idx.map(i=>pts[i]));
+    if (!f || f.r < 4.4 || f.r > 5.6) continue;
+    const inl = pts.filter(p => resid(p, f) < 0.2);
+    if (inl.length > bestCount) { bestCount = inl.length; bestSet = inl; }
+  }
+  if (!bestSet || bestSet.length < 4) return fitSphere(pts);
+  return fitSphere(bestSet);
+}
+// ---------------- Исполнитель ----------------
+function step(dt) {
+  const spd = S.fast ? 1e5 : +document.getElementById('speed').value;
+  const q = S.queue;
+  if (!q.length) return;
+  const c = q[0];
+  if (c.g && q._lastg !== c.g) { q._lastg = c.g; gmon(c.g, c.g); }
+  const head = S.active || headA;
+  const moveToward = (tx, ty, tz) => {
+    const dx = tx-head.x, dy = ty-head.y, dz = tz-head.z;
+    const d = Math.hypot(dx, dy, dz);
+    const stepLen = spd*dt;
+    if (d <= stepLen || d === 0) { head.x=tx; head.y=ty; head.z=tz; S.dist += d; return true; }
+    head.x += dx/d*stepLen; head.y += dy/d*stepLen; head.z += dz/d*stepLen;
+    S.dist += stepLen;
+    return false;
+  };
+  if (c.type === 'mv') {
+    if (moveToward(c.x, c.y, c.z)) { q.shift(); S.path.push({x:c.x, y:c.y}); }
+  } else if (c.type === 'msg') {
+    q.shift();
+    log('M117: ' + c.msg, 'info');
+  } else if (c.type === 'travel') {
+    // трёхфазный переход: вверх -> XY -> вниз
+    const h = head;
+    if (h.z < 59.5) {
+      if (moveToward(h.x, h.y, 60)) {}
+    } else if (Math.hypot(h.x-c.x, h.y-c.y) > 0.05) {
+      moveToward(c.x, c.y, 60);
+      if (Math.hypot(h.x-c.x, h.y-c.y) <= 0.05) S.path.push({x:c.x, y:c.y});
+    } else {
+      if (moveToward(c.x, c.y, c.z)) { q.shift(); }
+    }
+  } else if (c.type === 'press') {
+    // спуск до пола Z39, стоп на первом касании (клик с истинной высотой контакта).
+    // Фланговые касания блоком/чехлом легальны - по ним идёт грубое восхождение.
+    const floorZ = 39;
+    if (moveToward(c.x, c.y, floorZ)) {
+      const p = press(c.x, c.y);
+      const w = wpos(S.active);
+      if (maybeNoise()) {
+        mark(w.x, w.y, false, 40 + Math.random()*5);
+        log(`✗ наводка (ложный клик) на ${c.x.toFixed(1)},${c.y.toFixed(1)}`, 'bad');
+        S.bad++;
+      } else if (p) {
+        S.clicks++;
+        mark(w.x, w.y, p.el === 'сопло', p.z);
+        S.samples.push({x:c.x, y:c.y, z:p.z, el:p.el, bid:c.bid});
+        head.z = p.z;
+        if (p.el === 'сопло') log(`🔵 клик СОПЛОМ Z=${p.z.toFixed(2)} на ${c.x.toFixed(1)},${c.y.toFixed(1)}`, 'good');
+        else { log(`🔴 клик ${p.el} Z=${p.z.toFixed(2)} на ${c.x.toFixed(1)},${c.y.toFixed(1)}`, 'bad'); S.bad++; }
+        if (!S.bestClick || p.z > S.bestClick.z) S.bestClick = {x:c.x, y:c.y, z:p.z, el:p.el};
+        if (c.tag === 'scan') { S.queue = [{type:'phase2'}]; return; }
+      } else {
+        log(`· мимо на ${c.x.toFixed(1)},${c.y.toFixed(1)}`);
+      }
+      q.shift();
+      mv(c.x, c.y, 60);
+    }
+  } else if (c.type === 'phase2') {
+    q.shift(); buildPhase2();
+  } else if (c.type === 'sweep') {
+    if (moveToward(c.x1, c.y1, c.H)) {
+      const hit = sweep(c.x1, c.y1, c.x2, c.y2, c.H);
+      if (hit) {
+        S.clicks++;
+        head.x = hit.x; head.y = hit.y; head.z = c.H;
+        const good = hit.el === 'сопло';
+        const wh = wpos(S.active);
+        mark(wh.x, wh.y, good, c.H);
+        S.samples.push({x:hit.x, y:hit.y, z:c.H, el:hit.el});
+        log(`${good?'🔵':'🔴'} ватерлиния H=${c.H.toFixed(2)}: ${hit.el} (${hit.x.toFixed(1)},${hit.y.toFixed(1)})`, good?'good':'bad');
+        if (!good) S.bad++;
+        if (!S.bestClick || c.H > S.bestClick.z) S.bestClick = {x:hit.x, y:hit.y, z:c.H, el:hit.el};
+        S.queue = [{type:'wlhit', H: c.H, x: hit.x, y: hit.y}];
+      } else { head.x = c.x2; head.y = c.y2; q.shift(); }
+    }
+  } else if (c.type === 'wlhit') {
+    if (moveToward(c.x, c.y, c.H + 0.5)) {
+      const p = press(c.x, c.y);
+      S.clicks++;
+      if (p) {
+        mark(c.x, c.y, p.el==='сопло', p.z);
+        S.samples.push({x:c.x, y:c.y, z:p.z, el:p.el});
+        log(`уточнение: ${p.el==='сопло'?'🔵 СОПЛО':'🔴 '+p.el} Z=${p.z.toFixed(2)}`, p.el==='сопло'?'good':'bad');
+        if (p.el!=='сопло') S.bad++;
+        if (!S.bestClick || p.z > S.bestClick.z) S.bestClick = {x:c.x, y:c.y, z:p.z, el:p.el};
+      }
+      q.shift();
+      const b2 = S.bestClick || {x:c.x, y:c.y, z:c.H};
+      S.queue.push({type:'hillstep', x: b2.x, y: b2.y, z: b2.z, d: 2});
+      return;
+    }
+  } else if (c.type === 'wllevel') {
+    q.shift();
+  } else if (c.type === 'hstep') {
+    // шаг восхождения: 4 нажатия вокруг текущей точки, решение по их bid
+    q.shift();
+    S.bid++;
+    mv(c.x, c.y, 60);
+    for (const [dx, dy] of [[1,0],[-1,0],[0,1],[0,-1]]) {
+      const px = clx(c.x+dx*c.d), py = cly(c.y+dy*c.d);
+      mv(px, py, 60); doPress(px, py, 'h2', S.bid);
+    }
+    S.queue.push({type:'hdecide', x:c.x, y:c.y, z:c.z, d:c.d, bid:S.bid});
+  } else if (c.type === 'hdecide') {
+    q.shift();
+    const rec = S.samples.filter(s=>s.bid===c.bid);
+    let bestN = null, eq = false;
+    for (const s of rec) {
+      if (s.z > c.z + 0.03 && (!bestN || s.z > bestN.z)) bestN = s;
+      if (Math.abs(s.z - c.z) <= 0.03) eq = true;
+    }
+    const topRec = rec.reduce((a,s)=>!a||s.z>a.z?s:a, null);
+    if (bestN) S.queue.push({type:'hstep', x:bestN.x, y:bestN.y, z:bestN.z, d:Math.min(4, c.d*1.5)});
+    else if (eq && topRec && topRec.el==='сопло') S.queue.push({type:'ring', x:c.x, y:c.y}); // равные клики, лучший - СОПЛОМ = вершина
+    else if (eq || c.d <= 0.7) S.queue.push({type:'plateau', x:c.x, y:c.y, z:c.z, ri:0}); // плато чужим элементом (чехол/блок/штифт/воздуховод)
+    else S.queue.push({type:'hstep', x:c.x, y:c.y, z:c.z, d:c.d/2});
+  } else if (c.type === 'plateau') {
+    // застряли на плато (чехол/блок у вершины или ВОЗДУХОВОД в 15-18мм от шара):
+    // простукиваем кольца шире. Дальней ловушки требуют радиусов до 20:
+    // duct-плато лежит в ~15мм от центра, r=20 накрывает сферу с запасом
+    q.shift();
+    const RADII = [5, 9, 14, 20];
+    if (c.ri >= RADII.length) {
+      // дальнее плато (воздуховод/штифт): плато-центр = вершина МИНУС вынос элемента.
+      // Выносы - известная геометрия головы: прыгаем на +offset каждого торчащего
+      // элемента и делаем короткое восхождение
+      S.bid++;
+      const offs = [];
+      for (const e of els(S.active)) {
+        if (e.dx === 0 && e.dy === 0) continue; // сопло/чехол/блок - радиальные
+        const k = e.dx + ',' + e.dy;
+        if (!offs.some(o => o[0] === e.dx && o[1] === e.dy)) offs.push([e.dx, e.dy]);
+      }
+      for (const [dx, dy] of offs) {
+        const px = clx(c.x+dx), py = cly(c.y+dy);
+        mv(px, py, 60); doPress(px, py, 'jump', S.bid);
+      }
+      S.queue.push({type:'jdecide', x:c.x, y:c.y, z:c.z, bid:S.bid});
+      return;
+    }
+    S.bid++;
+    const rr = RADII[c.ri];
+    for (let k = 0; k < 8; k++) {
+      const a = k/8*2*Math.PI;
+      const px = clx(c.x+rr*Math.cos(a)), py = cly(c.y+rr*Math.sin(a));
+      mv(px, py, 60); doPress(px, py, 'h2', S.bid);
+    }
+    S.queue.push({type:'pdecide', x:c.x, y:c.y, z:c.z, ri:c.ri, bid:S.bid});
+  } else if (c.type === 'pdecide') {
+    q.shift();
+    const rec = S.samples.filter(s=>s.bid===c.bid);
+    // 1) любой клик СОПЛОМ - прыжок туда: сопло-клик всегда точка сферы,
+    //    дальше градиент сферы выведет на вершину
+    const nz = rec.find(s=>s.el==='сопло');
+    if (nz) { S.queue.push({type:'hstep', x:nz.x, y:nz.y, z:nz.z, d:4}); return; }
+    let bestN = null;
+    for (const s of rec) if (s.z > c.z + 0.04 && (!bestN || s.z > bestN.z)) bestN = s;
+    if (bestN) S.queue.push({type:'hstep', x:bestN.x, y:bestN.y, z:bestN.z, d:4});
+    else S.queue.push({type:'plateau', x:c.x, y:c.y, z:c.z, ri:c.ri+1});
+  } else if (c.type === 'jdecide') {
+    q.shift();
+    const rec = S.samples.filter(s=>s.bid===c.bid);
+    const nz = rec.find(s=>s.el==='сопло');
+    if (nz) { S.queue.push({type:'hstep', x:nz.x, y:nz.y, z:nz.z, d:2}); return; }
+    let best = null;
+    for (const s of rec) if (!best || s.z > best.z) best = s;
+    // прыжок рядом с вершиной (клик любой) - короткое восхождение вытащит
+    if (best && best.z > c.z - 1.0) S.queue.push({type:'hstep', x:best.x, y:best.y, z:best.z, d:2});
+    else S.queue.push({type:'ring', x:c.x, y:c.y}); // прыжки не дали - прежний путь
+  } else if (c.type === 'ring') {
+    // кольца точек сферы для МНК-фита. Ретрай (fittry>0) - шире, чтобы набрать
+    // сопло-точек с фланга, когда вершина найдена неточно
+    q.shift();
+    S.bid++;
+    const RADS = S.fittry > 0 ? [1.5, 3.2, 5.0] : [2.6, 4.3];
+    for (const rr of RADS) for (let k = 0; k < 6; k++) {
+      const a = k/6*2*Math.PI + (rr > 3 ? Math.PI/6 : 0);
+      const px = clx(c.x+rr*Math.cos(a)), py = cly(c.y+rr*Math.sin(a));
+      mv(px, py, 60); doPress(px, py, 'ring', S.bid);
+    }
+    S.queue.push({type:'spherefit'});
+  } else if (c.type === 'spherefit') {
+    q.shift();
+    const pts = S.samples.filter(s => s.el === 'сопло');
+    const f = sphereRANSAC(pts);
+    if (f && f.r > 4.4 && f.r < 5.6) {
+      S.fit = f;
+      log(`сфера: центр (${f.cx.toFixed(2)}, ${f.cy.toFixed(2)}) R=${f.r.toFixed(2)}, верш ${ (f.cz+f.r).toFixed(2)}, точек ${pts.length}`, 'warn');
+      S.queue.push({type:'verify', cx:f.cx, cy:f.cy, top:f.cz+f.r});
+    } else if (S.fittry < 1 && S.bestClick) {
+      S.fittry++;
+      log('сфера не сфитилась - кольцо вокруг лучшего клика', 'warn');
+      S.queue.push({type:'ring', x:S.bestClick.x, y:S.bestClick.y});
+    } else {
+      log('сфера не сфитилась - беру лучший клик', 'bad');
+      S.fit = null;
+      finish({algo:'sphere'});
+    }
+  } else if (c.type === 'verify') {
+    q.shift();
+    S.bid++;
+    mv(clx(c.cx), cly(c.cy), 60);
+    doPress(clx(c.cx), cly(c.cy), 'vf', S.bid);
+    S.queue.push({type:'vdecide', cx:c.cx, cy:c.cy, top:c.top, bid:S.bid});
+  } else if (c.type === 'vdecide') {
+    q.shift();
+    const s = S.samples.filter(x=>x.bid===c.bid).pop();
+    if (s && s.el === 'сопло' && Math.abs(s.z - c.top) <= 0.15) {
+      log(`верификация: сопло Z=${s.z.toFixed(2)} = сфера ${c.top.toFixed(2)} - ок`, 'good');
+      finish({algo:'sphere'});
+    } else if (S.vretry < 1) {
+      S.vretry++;
+      log('верификация не сошлась - второе кольцо вокруг центра сферы', 'warn');
+      S.queue.push({type:'ring', x:c.cx, y:c.cy});
+    } else {
+      log('верификация провалилась дважды - беру лучший клик', 'bad');
+      S.fit = null;
+      finish({algo:'sphere'});
+    }
+  } else if (c.type === 'hillstep') {
+    q.shift();
+    const {x, y, z, d} = c;
+    const dirs = [[1,0],[-1,0],[0,1],[0,-1]];
+    for (const [dx, dy] of dirs) { doTravel(x+dx*d, y+dy*d, 60); doPress(x+dx*d, y+dy*d, 'hill'); }
+    S.queue.push({type:'hilldecide', x, y, z, d});
+  } else if (c.type === 'hilldecide') {
+    q.shift();
+    const recent = S.samples.slice(-4);
+    let bestN = null;
+    for (const s of recent) if (s.z > c.z && (!bestN || s.z > bestN.z)) bestN = s;
+    if (bestN && c.d > 0.4) {
+      S.queue = [];
+      S.queue.push({type:'hillstep', x: bestN.x, y: bestN.y, z: bestN.z, d: c.d});
+    } else {
+      const b = S.bestClick || {x:c.x, y:c.y};
+      for (let dx = -1.5; dx <= 1.5; dx += 0.75)
+        for (let dy = -1.5; dy <= 1.5; dy += 0.75) {
+          doTravel(b.x+dx, b.y+dy, 60); doPress(b.x+dx, b.y+dy);
+        }
+      if (S.afterHill === 'sphere') {
+        S.afterHill = null;
+        for (let k = 0; k < 8; k++) {
+          const a = k/8*2*Math.PI;
+          const px = b.x + 3*Math.cos(a), py = b.y + 3*Math.sin(a);
+          mv(px, py, 60); doPress(px, py);
+        }
+        S.queue.push({type:'spherefit'});
+      } else {
+        finish({algo:'hill'});
+      }
+    }
+  } else if (c.type === 'switchB') {
+    // переключение голов: B едет "в ту же точку" в СВОЕЙ системе координат
+    q.shift();
+    S.active = headB;
+    log('--- Переключение на голову B (правая): паркуется в вершину A в своём кадре ---', 'warn');
+    const a = S.apexA;
+    S.queue = [];
+    mv(a.x, a.y, 60);
+    // B уже "около" шарика (в пределах истинного офсета ~10мм) - сразу фаза 2
+    S.bestClick = null; S.vretry = 0; S.fittry = 0;
+    // грубый клик в точке парковки задаёт старт ватерлинии
+    doPress(a.x, a.y);
+    S.queue.push({type:'phase2B'});
+  } else if (c.type === 'phase2B') {
+    q.shift();
+    // ВАЖНО: фазу 2 пушим В ОЧЕРЕДЬ после helpers - вызывать buildPhase2 синхронно
+    // нельзя: при наводке на парк-клике bestClick ещё пуст, и finish(null)
+    // обгонял helper-клики (вершиной становился сырой helper-клик без восхождения)
+    if (!S.bestClick) {
+      const a = S.apexA;
+      for (const [dx, dy] of [[6,0],[-6,0],[0,6],[0,-6]]) { mv(a.x+dx, a.y+dy, 60); doPress(a.x+dx, a.y+dy); }
+    }
+    S.queue.push({type:'phase2'});
+  } else if (c.type === 'done') {
+    q.shift();
+    if (!S.bestClick && S.retry < 2) {
+      // фаза 2 пуста (например, ложный клик наводки увёл в сторону) -
+      // продолжаем слепой поиск с места остановки
+      S.retry++;
+      log(`фаза 2 пуста - продолжаю поиск (попытка ${S.retry})`, 'warn');
+      S.running = true;
+      mv(head.x, head.y, 60);
+      scanPhase();
+      S.queue.push({type:'phase2'});
+      return;
+    }
+    S.running = false;
+    if (S.algo === 'sphere' && S.fit) {
+      S.result = {x: S.fit.cx, y: S.fit.cy, z: S.fit.cz + S.fit.r, el:'сфера(МНК)'};
+    } else {
+      const b = S.bestClick;
+      S.result = b ? {x:b.x, y:b.y, z:b.z, el:b.el} : null;
+    }
+    // --- этап головы A завершён: сохранить вершину и пойти к голове B ---
+    if (S.algo === 'manual') {
+      S.status = 'g-code выполнен';
+      document.getElementById('m_st').textContent = S.status;
+      if (S.onDone) { const f = S.onDone; S.onDone = null; f(S); }
+      return;
+    }
+    if (S.active === headA && S.result) {
+      S.apexA = {x: S.result.x, y: S.result.y, z: S.result.z};
+      log(`Вершина (голова A): X${S.apexA.x.toFixed(2)} Y${S.apexA.y.toFixed(2)} Z${S.apexA.z.toFixed(2)}`, 'good');
+      S.samples = []; S.fit = null; S.bestClick = null; S.result = null; S.retry = 0;
+      S.queue = [{type:'switchB'}];
+      S.running = true;
+      return;
+    }
+    if (S.active === headB && S.result) {
+      S.apexB = {x: S.result.x, y: S.result.y, z: S.result.z};
+      S.measuredOff = {
+        dx: S.apexB.x - S.apexA.x, dy: S.apexB.y - S.apexA.y, dz: S.apexB.z - S.apexA.z};
+      log(`Вершина (голова B): X${S.apexB.x.toFixed(2)} Y${S.apexB.y.toFixed(2)} Z${S.apexB.z.toFixed(2)}`, 'good');
+      log(`ИЗМЕРЕННЫЙ офсет B: dX=${S.measuredOff.dx.toFixed(3)} dY=${S.measuredOff.dy.toFixed(3)} dZ=${S.measuredOff.dz.toFixed(3)}`, 'warn');
+      const trueOff = {dx: -off.x, dy: -off.y, dz: -off.z};
+      log(`ИСТИННЫЙ офсет B:   dX=${trueOff.dx.toFixed(3)} dY=${trueOff.dy.toFixed(3)} dZ=${trueOff.dz.toFixed(3)}`, 'info');
+      const exy = Math.hypot(S.result.x - (ball.x - off.x), S.result.y - (ball.y - off.y));
+      const ez = S.result.z - (ball.top - off.z);
+      const eoff = {dx: S.measuredOff.dx - trueOff.dx, dy: S.measuredOff.dy - trueOff.dy, dz: S.measuredOff.dz - trueOff.dz};
+      log(`ошибка офсета: dX ${eoff.dx.toFixed(3)} dY ${eoff.dy.toFixed(3)} dZ ${eoff.dz.toFixed(3)}`, eoff.dx<0.5&&eoff.dy<0.5&&eoff.dz<0.5?'good':'bad');
+      S.status = (Math.abs(eoff.dx)<0.5 && Math.abs(eoff.dy)<0.5 && Math.abs(eoff.dz)<0.5) ? '✅ откалибровано' : '❌ офсет мимо';
+      document.getElementById('m_xy').textContent = Math.hypot(eoff.dx, eoff.dy).toFixed(2)+' мм';
+      document.getElementById('m_z').textContent = eoff.dz.toFixed(2)+' мм';
+      S.eoff = eoff;
+      updMetrics();
+      if (S.onDone) { const f = S.onDone; S.onDone = null; f(S); }
+      return;
+    }
+    if (S.result) {
+      const exy = Math.hypot(S.result.x-ball.x, S.result.y-ball.y);
+      const ez = S.result.z - ball.top;
+      log(`=== ИТОГ: (${S.result.x.toFixed(2)}, ${S.result.y.toFixed(2)}, ${S.result.z.toFixed(2)}) [${S.result.el}] ошибка XY ${exy.toFixed(2)} Z ${ez.toFixed(2)}`, 'info');
+      document.getElementById('m_xy').textContent = exy.toFixed(2)+' мм';
+      document.getElementById('m_z').textContent = ez.toFixed(2)+' мм';
+      S.status = exy < 1.0 && Math.abs(ez) < 0.5 ? '✅ найдено' : '❌ мимо';
+    } else { S.status = 'не найдено'; }
+    document.getElementById('m_st').textContent = S.status;
+    updMetrics();
+    if (S.onDone) { const f = S.onDone; S.onDone = null; f(S); }
+  }
+}
+// ---------------- Рендер ----------------
+const topC = document.getElementById('top'), sideC = document.getElementById('side');
+function fit(c) {
+  const r = c.getBoundingClientRect();
+  const w = Math.round(r.width*devicePixelRatio), h = Math.round(r.height*devicePixelRatio);
+  if (c.width !== w || c.height !== h) { c.width = w; c.height = h; }
+}
+function draw() {
+  fit(topC); fit(sideC);
+  const g = topC.getContext('2d');
+  const W = topC.width, H = topC.height;
+  const sc = Math.min(W/BED.w, H/BED.h)*0.92;
+  const ox = (W - BED.w*sc)/2, oy = (H - BED.h*sc)/2;
+  const X = x => ox + x*sc, Y = y => oy + (BED.h-y)*sc;
+  g.clearRect(0,0,W,H);
+  g.strokeStyle = '#313845'; g.lineWidth = 1;
+  for (let x=0;x<=BED.w;x+=10){g.beginPath();g.moveTo(X(x),Y(0));g.lineTo(X(x),Y(BED.h));g.stroke();}
+  for (let y=0;y<=BED.h;y+=10){g.beginPath();g.moveTo(X(0),Y(y));g.lineTo(X(BED.w),Y(y));g.stroke();}
+  g.strokeStyle = '#5a6b85'; g.setLineDash([3,3]);
+  g.beginPath(); g.moveTo(X(START.x)-8,Y(START.y)); g.lineTo(X(START.x)+8,Y(START.y));
+  g.moveTo(X(START.x),Y(START.y)-8); g.lineTo(X(START.x),Y(START.y)+8); g.stroke(); g.setLineDash([]);
+  g.fillStyle = '#5a6b85'; g.font = `${10*devicePixelRatio}px system-ui`;
+  g.fillText('старт', X(START.x)+6, Y(START.y)+12);
+  const grad = g.createRadialGradient(X(ball.x-1.5),Y(ball.y+1.5),1,X(ball.x),Y(ball.y),ball.r*sc);
+  grad.addColorStop(0,'#e8b26a'); grad.addColorStop(1,'#8a5a20');
+  g.fillStyle = grad; g.beginPath(); g.arc(X(ball.x),Y(ball.y),ball.r*sc,0,7); g.fill();
+  g.fillStyle = '#cfe2ff'; g.font = `${11*devicePixelRatio}px system-ui`;
+  g.fillText('шарик', X(ball.x)-14, Y(ball.y)-ball.r*sc-4);
+  g.strokeStyle = 'rgba(120,160,220,.35)'; g.beginPath();
+  S.path.forEach((p,i)=> i?g.lineTo(X(p.x),Y(p.y)):g.moveTo(X(p.x),Y(p.y)));
+  g.stroke();
+  for (const m of S.marks) {
+    g.fillStyle = m.good ? '#5fd35f' : '#ff6a4d';
+    g.beginPath(); g.arc(X(m.x),Y(m.y),4*devicePixelRatio,0,7); g.fill();
+    if (m.z !== undefined) {
+      g.fillStyle = '#8899aa'; g.font = `${9*devicePixelRatio}px monospace`;
+      g.fillText(m.z.toFixed(1), X(m.x)+6, Y(m.y)-4);
+    }
+  }
+  for (const h of [headB, headA]) {
+    const w = wpos(h);
+    g.globalAlpha = h === headB ? 0.45 : 1.0;
+    for (const e of els(h)) {
+      g.strokeStyle = e.name==='сопло' ? (h===headB?'#9fd0ff':'#ffffff') : (e.name==='штифт' ? '#ffd479' : '#7d8aa0');
+      g.setLineDash(e.name==='сопло'?[]:[4,3]);
+      g.beginPath(); g.arc(X(w.x+e.dx), Y(w.y+e.dy), Math.max(e.r*sc,3), 0, 7); g.stroke();
+      g.setLineDash([]);
+    }
+    g.fillStyle = h===headB ? '#9fd0ff' : '#fff';
+    g.beginPath(); g.arc(X(w.x),Y(w.y),3*devicePixelRatio,0,7); g.fill();
+    g.globalAlpha = 1;
+  }
+  g.font = `${10*devicePixelRatio}px system-ui`;
+  g.fillStyle='#9fd0ff'; g.fillText('B', X(wpos(headB).x)+6, Y(wpos(headB).y)-6);
+  g.fillStyle='#fff'; g.fillText('A', X(wpos(headA).x)+6, Y(wpos(headA).y)-6);
+  if (S.result) {
+    g.strokeStyle = '#ffd479'; g.lineWidth = 2;
+    g.beginPath(); g.arc(X(S.result.x),Y(S.result.y),8*devicePixelRatio,0,7); g.stroke();
+  }
+  // ---- вид сбоку: проекция всех касаний на X-Z ----
+  const s = sideC.getContext('2d');
+  const SW = sideC.width, SH = sideC.height;
+  s.clearRect(0,0,SW,SH);
+  const zTop = 56, zBot = 42;
+  const zY = z => SH*0.86 - (z-zBot)/(zTop-zBot)*SH*0.72;
+  const xX = x => 20*devicePixelRatio + (x/BED.w)*(SW-30*devicePixelRatio);
+  s.strokeStyle='#313845'; s.beginPath(); s.moveTo(0,zY(zBot)); s.lineTo(SW,zY(zBot)); s.stroke();
+  s.fillStyle='#8899aa'; s.font = `${10*devicePixelRatio}px monospace`;
+  s.fillText('вид сбоку (X-Z): 🔵 зелёные = сопло, 🔴 красные = чужой элемент', 10*devicePixelRatio, 14*devicePixelRatio);
+  s.strokeStyle='#e8b26a'; s.lineWidth=2;
+  s.beginPath(); s.arc(xX(ball.x), zY(ball.top-ball.r), ball.r*(SW-30*devicePixelRatio)/BED.w, 0, 7); s.stroke();
+  for (const h of [headB, headA]) {
+    const w = wpos(h);
+    s.globalAlpha = h === headB ? 0.45 : 1.0;
+    for (const e of els(h)) {
+      const ex = w.x+e.dx;
+      s.strokeStyle = e.name==='сопло' ? (h===headB?'#9fd0ff':'#ffffff') : (e.name==='штифт' ? '#ffd479' : '#7d8aa0');
+      s.setLineDash(e.name==='сопло'?[]:[4,3]);
+      s.beginPath(); s.moveTo(xX(ex-e.r), zY(w.z+e.zo)); s.lineTo(xX(ex+e.r), zY(w.z+e.zo)); s.stroke();
+      s.setLineDash([]);
+    }
+    s.globalAlpha = 1;
+  }
+  for (const m of S.marks) {
+    if (m.z === undefined || m.z === null) continue;
+    s.fillStyle = m.good ? '#5fd35f' : '#ff6a4d';
+    s.beginPath(); s.arc(xX(m.x), zY(m.z), 3*devicePixelRatio, 0, 7); s.fill();
+  }
+  if (S.result) {
+    s.strokeStyle='#ffd479'; s.lineWidth=2;
+    s.beginPath(); s.arc(xX(S.result.x), zY(S.result.z), 6*devicePixelRatio, 0, 7); s.stroke();
+  }
+}
+function updMetrics() {
+  document.getElementById('m_clicks').textContent = S.clicks;
+  document.getElementById('m_bad').textContent = S.bad;
+  document.getElementById('m_dist').textContent = S.dist.toFixed(0);
+  document.getElementById('m_st').textContent = S.status;
+}
+let lastT = 0;
+function loop(t) {
+  requestAnimationFrame(loop);
+  const dt = Math.min(0.05, (t-lastT)/1000); lastT = t;
+  try {
+    if (S.running && !S.fast) { step(dt); updMetrics(); }
+    draw();
+  } catch (e) {
+    if (!loop.warned) { loop.warned = true; console.error(e); }
+  }
+}
+requestAnimationFrame(loop);
+// ---------------- Управление ----------------
+function bindVal(id, vid, f=v=>v) {
+  const el = document.getElementById(id), out = document.getElementById(vid);
+  const u = () => out.textContent = f(el.value);
+  el.addEventListener('input', u); u();
+}
+bindVal('speed','v_speed', v=>v+' мм/с');
+bindVal('rb','v_rb', v=>v+' мм'); bindVal('zb','v_zb', v=>v+' мм');
+bindVal('dd','v_dd', v=>v+' мм'); bindVal('zd','v_zd', v=>v+' мм');
+bindVal('rs','v_rs', v=>v+' мм'); bindVal('zs','v_zs', v=>v+' мм');
+bindVal('zp','v_zp', v=>v+' мм'); bindVal('bl','v_bl', v=>v+' мм');
+bindVal('wl','v_wl', v=>v+' мм'); bindVal('wr','v_wr', v=>v+' мм');
+bindVal('gs','v_gs', v=>v+' мм');
+function syncHead() {
+  geo.rb=+document.getElementById('rb').value; geo.zb=+document.getElementById('zb').value;
+  geo.dd=+document.getElementById('dd').value; geo.zd=+document.getElementById('zd').value;
+  geo.rs=+document.getElementById('rs').value; geo.zs=+document.getElementById('zs').value;
+  geo.zp=+document.getElementById('zp').value;
+  geo.bl=+document.getElementById('bl').value;
+}
+['rb','zb','dd','zd','rs','zs','zp','bl'].forEach(id => document.getElementById(id).addEventListener('input', syncHead));
+function startRun() {
+  syncHead();
+  const ko = document.getElementById('keepoff');
+  if (!(ko && ko.checked)) randOff();
+  S.active = headA;
+  headA.x = START.x; headA.y = START.y; headA.z = 60;
+  headB.x = START.x; headB.y = START.y; headB.z = 60;
+  S.running = true; S.fast = false;
+  S.clicks=0; S.bad=0; S.dist=0; S.marks=[]; S.path=[]; S.queue=[];
+  S.result=null; S.bestClick=null; S.samples=[]; S.fit=null; S.afterHill=null; S.retry=0; S.status='работает';
+  S.apexA=null; S.apexB=null; S.measuredOff=null; S.eoff=null; S.bid=0; S.vretry=0; S.fittry=0; S.logbuf=[];
+  updMetrics();
+  S.noise = document.getElementById('noise').checked;
+  S.algo = document.getElementById('algo').value;
+  log(`▶ запуск: ${S.algo}`, 'info');
+  mv(START.x, START.y, 60);
+  scanPhase();
+  S.queue.push({type:'phase2'});
+}
+document.getElementById('run').onclick = startRun;
+
+// ---- ручной G-код ----
+function parseGcode(text) {
+  const steps = [];
+  for (const raw of text.split('\n')) {
+    const line = raw.split(';')[0].trim();
+    if (!line) continue;
+    const parts = line.split(/\s+/);
+    const cmd = parts[0].toUpperCase();
+    const p = {};
+    for (const tok of parts.slice(1)) {
+      const k = tok[0].toUpperCase();
+      const v = parseFloat(tok.slice(1));
+      if (!isNaN(v)) p[k] = v;
+    }
+    if (cmd === 'G0' || cmd === 'G1') {
+      const h = S.active || headA;
+      steps.push({type:'mv', g: line,
+        x: p.X !== undefined ? p.X : h.x,
+        y: p.Y !== undefined ? p.Y : h.y,
+        z: p.Z !== undefined ? p.Z : h.z});
+    } else if (cmd === 'G38.2' || cmd === 'G38.3') {
+      const h = S.active || headA;
+      if (p.Z !== undefined && p.Z < h.z) {
+        steps.push({type:'press', g: line, x: p.X !== undefined ? p.X : h.x, y: p.Y !== undefined ? p.Y : h.y});
+        // press спускается до Z45 (пол) - для иного пола менять coarse_floor
+      } else if (p.X !== undefined || p.Y !== undefined) {
+        steps.push({type:'sweep', g: line,
+          x1: h.x, y1: h.y,
+          x2: p.X !== undefined ? p.X : h.x,
+          y2: p.Y !== undefined ? p.Y : h.y,
+          H: h.z});
+      }
+    } else if (cmd === 'M117') {
+      steps.push({type:'msg', g: line, msg: parts.slice(1).join(' ')});
+    } else {
+      steps.push({type:'msg', g: line, msg: '(пропущено) ' + line});
+    }
+  }
+  return steps;
+}
+document.getElementById('rung').onclick = () => {
+  syncHead();
+  S.running = true; S.fast = false;
+  S.marks=[]; S.path=[]; S.queue=[];
+  S.result=null; S.status='g-code';
+  S.noise = document.getElementById('noise').checked;
+  S.algo = 'manual';
+  log('▶ выполнение пользовательского G-кода', 'info');
+  const steps = parseGcode(document.getElementById('gcode').value);
+  steps.push({type:'done', res: {algo:'manual'}, g: '; конец программы'});
+  S.queue = steps;
+};
+function runFastOnce() {
+  ball.x = 18 + Math.random()*(BED.w-36);
+  ball.y = 14 + Math.random()*(BED.h-28);
+  startRun();
+  S.fast = true; S.running = true;
+  let guard = 0;
+  while (S.queue.length && guard++ < 400000) step(0.02);
+  const ok = !!(S.eoff && Math.abs(S.eoff.dx)<0.5 && Math.abs(S.eoff.dy)<0.5 && Math.abs(S.eoff.dz)<0.5 && S.apexA && S.apexB);
+  const exy = S.eoff ? Math.hypot(S.eoff.dx, S.eoff.dy) : null;
+  const ez = S.eoff ? S.eoff.dz : null;
+  return {exy, ez, clicks: S.clicks, bad: S.bad, dist: S.dist, ok, eoff: S.eoff};
+}
+document.getElementById('batch').onclick = () => {
+  syncHead();
+  const N = 15;
+  const rs = [];
+  for (let i = 0; i < N; i++) rs.push(runFastOnce());
+  const oks = rs.filter(r=>r.ok).length;
+  const exy = rs.filter(r=>r.ok).map(r=>r.exy);
+  const ez = rs.filter(r=>r.ok).map(r=>Math.abs(r.ez));
+  const med = a => a.length ? a.slice().sort((x,y)=>x-y)[Math.floor(a.length/2)] : NaN;
+  const line1 = `Серия ×${N} [${S.algo}${S.noise?'+шум':''}] полный цикл: успехов ${oks}/${N}`;
+  const line2 = `медиана |dXY| ${med(exy).toFixed(3)}мм, |dZ| ${med(ez).toFixed(3)}мм, кликов ~${Math.round(rs.reduce((s,r)=>s+r.clicks,0)/N)}, плохих ~${Math.round(rs.reduce((s,r)=>s+r.bad,0)/N)}`;
+  log(line1, oks===N?'good':'warn'); log(line2, 'info');
+  document.getElementById('batchout').textContent = line1 + '\n' + line2;
+  document.title = 'SIM: ' + line1 + ' ' + line2;
+  S.running = false; S.fast = false;
+};
+document.getElementById('reset').onclick = () => {
+  S.running=false; S.queue=[]; S.marks=[]; S.path=[]; S.result=null; S.active=headA;
+  S.clicks=0; S.bad=0; S.dist=0; S.status='ожидание'; S.samples=[]; updMetrics();
+  document.getElementById('log').innerHTML='';
+  document.getElementById('batchout').textContent='';
+};
+// автозапуск серии через URL:
+//   ?autobatch=1[&algo=sphere]            - 15 случайных позиций (как кнопка «Серия»)
+//   ?test=grid&algo=sphere[&noise=1][&reps=2] - систематическая сетка 5x5 позиций
+//   ?algo=sphere (без test) - просто выбрать алгоритм в UI (анимация кнопкой Пуск)
+// Результат пишется в #batchout (таблица) и в document.title (сводка).
+{
+  const pm0 = name => { const m = location.search.match(new RegExp('[?&]'+name+'=([^&]+)')); return m ? m[1] : null; };
+  const am0 = pm0('algo');
+  if (am0) document.getElementById('algo').value = am0;
+}
+if (location.search.includes('autobatch') || location.search.includes('test=')) {
+  const pm = name => { const m = location.search.match(new RegExp('[?&]'+name+'=([^&]+)')); return m ? m[1] : null; };
+  const am = pm('algo');
+  if (am) document.getElementById('algo').value = am;
+  if (pm('noise')) document.getElementById('noise').checked = true;
+  const seedm = pm('seed');
+  if (seedm !== null) rng = mulberry32(+seedm || 1);
+  if (pm('pin') === '0') document.getElementById('pin').checked = false;
+  // геометрия из URL: g_rb, g_zb, g_dd, g_zd, g_rs, g_zs, g_zp, g_bl (стресс-тесты голов)
+  for (const [p, id] of [['g_rb','rb'],['g_zb','zb'],['g_dd','dd'],['g_zd','zd'],['g_rs','rs'],['g_zs','zs'],['g_zp','zp'],['g_bl','bl']]) {
+    const v = pm(p);
+    if (v !== null) document.getElementById(id).value = v;
+  }
+  setTimeout(() => {
+    try {
+      if (location.search.includes('test=grid') || location.search.includes('test=single')) {
+        syncHead();
+        const xs = [20, 38, 55, 72, 90], ys = [16, 28, 40, 52, 64];
+        // центры ячеек слепой сетки 24мм — «дыры» покрытия, стресс для фазы 1
+        const holes = [[24,24],[48,24],[72,24],[24,48],[48,48],[72,48]];
+        const poses = [];
+        for (const gx of xs) for (const gy of ys) poses.push([gx, gy]);
+        for (const [gx, gy] of holes) poses.push([gx, gy]);
+        // сид прогона = функция(мастер-сид, позиция): прогон самодостаточен и
+        // воспроизводим в ?test=single&bx&by&seed=тот_же
+        const master = +(pm('seed') || 1);
+        const poseSeed = (p) => master*7919 + p[0]*131 + p[1]*17;
+        if (location.search.includes('test=single')) {
+          ball.x = +(pm('bx') || 55); ball.y = +(pm('by') || 40);
+          rng = mulberry32(poseSeed([ball.x, ball.y]));
+          log(`=== ОДИНОЧНЫЙ ПРОГОН: шарик на (${ball.x},${ball.y}), офсет скрыт ===`, 'warn');
+          startRun(); S.fast = true; S.running = true;
+          let guard = 0;
+          while (S.queue.length && guard++ < 400000) step(0.02);
+          log(`конец: clicks=${S.clicks} bad=${S.bad} dist=${Math.round(S.dist)}мм`, 'info');
+          document.title = `SINGLE: clicks=${S.clicks} bad=${S.bad} eoff=${S.eoff?S.eoff.dx.toFixed(3)+'/'+S.eoff.dy.toFixed(3)+'/'+S.eoff.dz.toFixed(3):'-'}`;
+          return;
+        }
+        const reps = +(pm('reps') || 2);
+        const rows = []; const all = [];
+        for (let rep = 0; rep < reps; rep++)
+          for (const [gx, gy] of poses) {
+            ball.x = gx; ball.y = gy;
+            rng = mulberry32(poseSeed([gx, gy]) + rep*104729);
+            startRun(); S.fast = true; S.running = true;
+            let guard = 0;
+            while (S.queue.length && guard++ < 400000) step(0.02);
+            const r = {pos: `(${gx},${gy})`, ok: !!(S.eoff && Math.abs(S.eoff.dx)<0.5 && Math.abs(S.eoff.dy)<0.5 && Math.abs(S.eoff.dz)<0.5),
+              exy: S.eoff ? Math.hypot(S.eoff.dx, S.eoff.dy) : NaN,
+              ez: S.eoff ? Math.abs(S.eoff.dz) : NaN,
+              clicks: S.clicks, bad: S.bad, dist: S.dist};
+            all.push(r);
+            rows.push(`${r.ok?'✓':'✗'} ${r.pos} XY${isNaN(r.exy)?'-':r.exy.toFixed(3)} Z${isNaN(r.ez)?'-':r.ez.toFixed(3)} кл${r.clicks} плх${r.bad} путь${Math.round(r.dist)}мм`);
+            if (!r.ok) {
+              // полный буфер лога упавшего прогона (новое - в конце)
+              rows.push('--- лог провала ---\n' + S.logbuf.join('\n'));
+              S.logbuf = [];
+            } else S.logbuf = [];
+          }
+        const oks = all.filter(r=>r.ok);
+        const med = a => a.length ? a.slice().sort((x,y)=>x-y)[Math.floor(a.length/2)] : NaN;
+        const mx = a => a.length ? Math.max(...a) : NaN;
+        const sum = `GRID [${S.algo}${S.noise?'+шум':''}]: ${oks.length}/${all.length} ok | medXY ${med(oks.map(r=>r.exy)).toFixed(3)} medZ ${med(oks.map(r=>r.ez)).toFixed(3)} | кл med${Math.round(med(all.map(r=>r.clicks)))} max${Math.round(mx(all.map(r=>r.clicks)))} | плх med${Math.round(med(all.map(r=>r.bad)))} | путь med${Math.round(med(all.map(r=>r.dist)))} max${Math.round(mx(all.map(r=>r.dist)))}мм`;
+        log(sum, oks.length===all.length?'good':'bad');
+        document.getElementById('batchout').textContent = sum + '\n' + rows.join('\n');
+        document.title = 'GRID: ' + sum;
+      } else {
+        document.getElementById('batch').dispatchEvent(new Event('click'));
+      }
+    } catch (e) { console.error(e); document.title = 'GRID ERROR: ' + e.message; }
+  }, 800);
+}
+// перетаскивание шарика
+let drag=false;
+function toWorld(e) {
+  const r = topC.getBoundingClientRect();
+  const sc = Math.min(r.width/BED.w, r.height/BED.h)*0.92;
+  const ox=(r.width-BED.w*sc)/2, oy=(r.height-BED.h*sc)/2;
+  return {x:(e.clientX-r.left-ox)/sc, y:BED.h-(e.clientY-r.top-oy)/sc};
+}
+topC.addEventListener('pointerdown', e => {
+  const p = toWorld(e);
+  if (Math.hypot(p.x-ball.x, p.y-ball.y) < ball.r+5) drag=true;
+});
+topC.addEventListener('pointermove', e => {
+  if (!drag) return;
+  const p = toWorld(e);
+  ball.x = Math.max(15,Math.min(BED.w-15,p.x));
+  ball.y = Math.max(12,Math.min(BED.h-12,p.y));
+});
+addEventListener('pointerup', ()=> drag=false);
+</script>
+</body>
+</html>

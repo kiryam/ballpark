@@ -1,0 +1,15 @@
+Vendored third-party assets (not covered by the repository MIT license):
+
+- ballpark/sim/three.module.js, OrbitControls.js, STLLoader.js
+  three.js and its examples — MIT License, © 2010-2024 three.js authors
+  https://threejs.org
+
+- ballpark/sim/stealthburner_body.stl
+  Voron StealthBurner main body — VoronDesign
+  License: CC-BY-NC-SA 4.0 — https://github.com/VoronDesign/Voron-Stealthburner
+
+- ballpark/sim/cw_*.stl
+  Voron Clockwork2 (Direct Drive) extruder parts — VoronDesign
+  License: CC-BY-NC-SA 4.0 — https://github.com/VoronDesign/Voron-Stealthburner
+
+The 3D models are used as visual reference in the simulator only.

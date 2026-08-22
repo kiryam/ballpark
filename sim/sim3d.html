@@ -1,0 +1,1069 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Ballpark 3D Simulator — IDEX, G-code, real toolheads</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 0; background: #14171d; color: #dfe3ea; display: flex; height: 100vh; }
+  #view { flex: 1; position: relative; min-width: 0; }
+  canvas { display: block; }
+  #hud { position: absolute; top: 8px; left: 10px; font-size: 12px; color: #9fb3d1; background: rgba(20,23,29,.7); padding: 4px 8px; border-radius: 6px; pointer-events: none; }
+  .right { width: 370px; overflow-y: auto; padding: 8px; background: #181c23; }
+  .panel { background: #20252e; border-radius: 8px; padding: 10px; margin-bottom: 10px; }
+  .panel h3 { margin: 0 0 8px; font-size: 13px; color: #9fb3d1; text-transform: uppercase; letter-spacing: .5px; }
+  label { display: block; font-size: 12px; margin: 6px 0 2px; color: #aab4c4; }
+  input[type=range] { width: 100%; }
+  .val { float: right; color: #7fbf7f; font-variant-numeric: tabular-nums; }
+  button { background: #3565b5; border: 0; color: #fff; padding: 8px 14px; border-radius: 6px; font-size: 14px; cursor: pointer; margin-right: 6px; margin-top: 4px; }
+  button.stop { background: #b54835; }
+  button.batch { background: #3a8a5a; }
+  #metrics { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; font-size: 13px; }
+  #metrics div { background: #141820; padding: 6px 8px; border-radius: 6px; }
+  #metrics b { color: #ffd479; }
+  #gmon { font-family: ui-monospace, monospace; font-size: 11px; height: 140px; overflow-y: auto; background: #141820; border-radius: 6px; padding: 6px; color: #9fd0ff; white-space: pre-wrap; }
+  #log { font-family: ui-monospace, monospace; font-size: 11px; height: 170px; overflow-y: auto; background: #141820; border-radius: 6px; padding: 6px; }
+  .good { color: #7fd47f; } .bad { color: #ff8f7a; } .info { color: #9fb3d1; } .warn { color: #ffd479; }
+  #batchout { font-family: ui-monospace, monospace; font-size: 11px; white-space: pre; margin-top: 6px; }
+  .hint { font-size: 11px; color: #77839a; margin-top: 4px; }
+</style>
+<script type="importmap">
+{ "imports": { "three": "./three.module.js", "three/addons/": "./" } }
+</script>
+</head>
+<body>
+<div id="view">
+  <div id="hud">IDEX: two carriages on one X gantry · inactive one parks · lateral touch by a non-nozzle element = ball moved<br>
+  LMB — orbit · wheel — zoom · drag the ball with the mouse</div>
+</div>
+<div class="right">
+  <div class="panel">
+    <h3>Run</h3>
+    <div id="algo-prog">algorithm: sphere v8 (IDEX, G-code)</div>
+    <label>Animation speed ×<span class="val" id="v_speed"></span> (×1 = real time)</label>
+    <input type="range" id="speed" min="0.5" max="100" step="0.5" value="1">
+    <label><input type="checkbox" id="noise"> Wire noise (false clicks 3%)</label>
+    <label><input type="checkbox" id="pin" checked> Decoy pin (on A)</label>
+    <div style="margin-top:8px">
+      <button id="run">▶ Start</button>
+      <button id="batch" class="batch">⏩ Batch ×15</button>
+      <button id="reset" class="stop">↺ Reset</button>
+    </div>
+    <div class="hint">The algorithm generates G-code (X — active head carriage, Y — gantry, Z — shared).
+    G38.2 returns the trigger position. T0/T1 — carriage activation (no hidden moves).</div>
+  </div>
+  <div class="panel">
+    <h3>Nozzle B offset (carriage mount)</h3>
+    <label>X, mm <span class="val" id="v_nbx"></span></label>
+    <input type="range" id="nbx" min="-20" max="20" step="0.1" value="8">
+    <label>Y, mm <span class="val" id="v_nby"></span></label>
+    <input type="range" id="nby" min="-10" max="10" step="0.1" value="0">
+    <label>Z, mm <span class="val" id="v_nbz"></span></label>
+    <input type="range" id="nbz" min="-2" max="2" step="0.05" value="0">
+    <label><input type="checkbox" id="randB" checked> Random B offset on every run</label>
+    <div class="hint">Move a slider — nozzle B shifts on the scene instantly. Manual move disables the random mode.</div>
+  </div>
+  <div class="panel">
+    <h3>Run metrics</h3>
+    <div id="metrics">
+      <div>XY error: <b id="m_xy">—</b></div>
+      <div>Z error: <b id="m_z">—</b></div>
+      <div>Clicks: <b id="m_clicks">0</b></div>
+      <div>Bad: <b id="m_bad">0</b></div>
+      <div>Ball moves: <b id="m_mv">0</b></div>
+      <div>Path, mm: <b id="m_dist">0</b></div>
+      <div>Status: <b id="m_st">idle</b></div>
+      <div>Head: <b id="m_head">A</b></div>
+      <div style="grid-column: 1 / -1">Nozzle B offset (result): <b id="m_off" style="color:#7fd47f">—</b></div>
+      <div style="grid-column: 1 / -1">True B offset (hidden from the algorithm): <b id="m_true" style="color:#9fb3d1">—</b></div>
+      <div style="grid-column: 1 / -1">Error (measured − true): <b id="m_diff" style="color:#ffd479">—</b></div>
+    </div>
+  </div>
+  <div class="panel">
+    <h3>G-code (engine transcript)</h3>
+    <div id="gmon"></div>
+  </div>
+  <div class="panel">
+    <h3>Log</h3>
+    <div id="log"></div>
+    <div id="batchout"></div>
+  </div>
+</div>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from './OrbitControls.js';
+import { STLLoader } from './STLLoader.js';
+'use strict';
+// =====================================================================
+//  World. Bed 400x260 (printer: X right, Y into depth, Z up).
+//  Two carriages on one X gantry: A is always left of B (min gap SPACING).
+//  Y (gantry) and Z are shared. The nozzle is offset from its carriage by nX/nY/nZ
+//  (imperfect head mount; X dominates, Y/Z are fractions of a mm).
+//  G-code addresses the CARRIAGE position — like real Klipper.
+// =====================================================================
+const BED = {w: 400, h: 260};
+let BALL_R = 5;   // can be overridden from URL (?br=..) to test odd balls
+let BALL_CZ = 44.5;   // recomputed for ?br=                  // ball center (bottom on bed at 39.5, top 49.5)
+const SPACING = 60;              // min X gap between carriages
+const PARK_A = 25, PARK_B = 375; // carriage park positions
+const START = {x: 200, y: 130};
+const ball = {x: 200, y: 130};
+const geo = {rb: 11, zb: 4.5, dd: 15, zd: 2.5, rs: 6, zs: 1.5, zp: 1, bl: 1.5};
+// nozzle offsets (hidden from the algorithm): tiny for A, X-dominant for B
+const nA = {x: 0, y: 0, z: 0}, nB = {x: 0, y: 0, z: 0};
+// manual nozzle-B offset from sliders; with randB a random one is drawn and the sliders sync
+function applyNBFromSliders() {
+  nB.x = +document.getElementById('nbx').value;
+  nB.y = +document.getElementById('nby').value;
+  nB.z = +document.getElementById('nbz').value;
+}
+function syncNBSliders() {
+  document.getElementById('nbx').value = nB.x.toFixed(1);
+  document.getElementById('nby').value = nB.y.toFixed(1);
+  document.getElementById('nbz').value = nB.z.toFixed(2);
+  for (const id of ['nbx','nby','nbz']) document.getElementById('v_'+id).textContent = document.getElementById(id).value;
+}
+function randToolOffsets() {
+  nA.x = 0.2 + rng()*2.3;  nA.y = (rng()-0.5)*0.6;  nA.z = (rng()-0.5)*0.6;
+  if (document.getElementById('randB').checked) {
+    nB.x = 5 + rng()*10;      nB.y = (rng()-0.5)*6;    nB.z = (rng()-0.5)*0.8;
+    syncNBSliders();
+  } else applyNBFromSliders();
+}
+let rng = Math.random;
+function mulberry32(a) { return function() { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+function els(headB) {
+  const d = headB ? geo.bl : 0;
+  const e = [
+    {name:'nozzle', dx:0, dy:0, r:0.4, zo:0},
+    {name:'sock', dx:0, dy:0, r:geo.rs, zo:geo.zs + d},
+    {name:'block', dx:0, dy:0, r:geo.rb, zo:geo.zb + d},
+    {name:'duct L', dx:-geo.dd, dy:0, r:4, zo:geo.zd + d},
+    {name:'duct R', dx:+geo.dd, dy:0, r:4, zo:geo.zd + d},
+  ];
+  const pin = document.getElementById('pin');
+  if (!headB && pin && pin.checked) e.push({name:'pin', dx:-6, dy:4, r:0.6, zo:geo.zp});
+  return e;
+}
+// =====================================================================
+//  The G-code executor is the single source of motion.
+// =====================================================================
+const M = {
+  carr: {A: START.x, B: PARK_B},   // carriage X positions
+  beam: {y: START.y, z: 60},       // shared Y (gantry) and Z
+  active: 'A', feed: 6000, probeFeed: 240,
+  cur: null, line: null, lastProbe: null,
+  clicks: 0, bad: 0, dist: 0, ballMoves: 0, noise: false,
+  pre: 0, jit: 0, bump: 0, noisePct: 3,
+  n() { return this.active === 'B' ? nB : nA; },
+  pos() { return {x: this.carr[this.active], y: this.beam.y, z: this.beam.z}; },
+  setPos(x, y, z) {
+    if (x !== null && x !== undefined) {
+      let tx = Math.max(0, Math.min(BED.w, x));
+      // gantry invariant: A stays left of B with a gap
+      const lim = this.active === 'A' ? this.carr.B - SPACING : this.carr.A + SPACING;
+      if (this.active === 'A') tx = Math.min(tx, lim); else tx = Math.max(tx, lim);
+      if (Math.abs(tx - x) > 0.01) {
+        log(`⁃ beam limit: X clamped ${x.toFixed(1)} → ${tx.toFixed(1)} (inactive carriage in the way)`, 'warn');
+        x = tx;
+      }
+      this.carr[this.active] = x;
+    }
+    if (y !== null && y !== undefined) this.beam.y = y;
+    if (z !== null && z !== undefined) this.beam.z = z;
+  },
+  world() { const p = this.pos(), n = this.n();
+    return {x: p.x + n.x, y: p.y + n.y, z: p.z + n.z}; },
+  // Exact first-contact analytics for a vertical descent (logical coordinates).
+  // The nozzle is a POINT (r=0): fit samples lie exactly on the sphere. A stop leaves
+  // a 0.4mm tip penetration per minGap - the retreat does not push it (approach filter)
+  verticalProbe(wx, wy, zTopLogical, zFloorLogical) {
+    const n = this.n(), isB = this.active === 'B';
+    let best = null;
+    for (const e of els(isB)) {
+      const re = e.name === 'nozzle' ? 0 : e.r;
+      const dxy = Math.hypot(wx + e.dx - ball.x, wy + e.dy - ball.y);
+      const horiz = Math.max(dxy - re, 0);
+      if (horiz > BALL_R) continue;
+      const surf = BALL_CZ + Math.sqrt(BALL_R*BALL_R - horiz*horiz);
+      const zc = surf - e.zo - n.z;
+      if (zc < zFloorLogical || zc > zTopLogical + 1e-9) continue;
+      if (!best || zc > best.z) best = {z: zc, el: e.name};
+    }
+    return best;
+  },
+  minGap() {
+    const w = this.world(), isB = this.active === 'B';
+    let g = Infinity, el = null, ex = 0, ey = 0;
+    for (const e of els(isB)) {
+      const ecx = w.x + e.dx, ecy = w.y + e.dy;
+      const dxy = Math.hypot(ecx - ball.x, ecy - ball.y);
+      const horiz = Math.max(dxy - e.r, 0);
+      const vert = (w.z + e.zo) - BALL_CZ;
+      const d = Math.hypot(horiz, vert);
+      if (d < g) { g = d; el = e.name; ex = ecx; ey = ecy; }
+    }
+    return {gap: g - BALL_R, el, ex, ey};
+  },
+  // the ball is physically pushed away when touched laterally by a NON-nozzle element
+  pushBallAway(ex, ey, elName) {
+    const b0 = {x: ball.x, y: ball.y};
+    for (let i = 0; i < 600 && this.minGap().gap <= 0; i++) {
+      let dx = ball.x - ex, dy = ball.y - ey;
+      const L = Math.hypot(dx, dy) || 1;
+      ball.x += dx/L*0.05; ball.y += dy/L*0.05;
+    }
+    const d = Math.hypot(ball.x - b0.x, ball.y - b0.y);
+    this.ballMoves++;
+    mark(ball.x, ball.y, 40, 0xff2a1a);
+    const w = this.world();
+    log(`⚠ BALL MOVED ${elName} by ${d.toFixed(2)}mm → (${ball.x.toFixed(1)},${ball.y.toFixed(1)}); carriage X${w.x.toFixed(1)} Y${w.y.toFixed(1)} Z${w.z.toFixed(1)}; command: ${this.line} - NOT ALLOWED`, 'bad');
+  },
+  loadLine(str) {
+    this.line = str;
+    const parts = str.split(';')[0].trim().split(/\s+/);
+    const cmd = parts[0].toUpperCase();
+    const p = {};
+    for (const t of parts.slice(1)) { const v = parseFloat(t.slice(1)); if (!isNaN(v)) p[t[0].toUpperCase()] = v; }
+    if (cmd === 'G0' || cmd === 'G1') {
+      const pos = this.pos();
+      this.cur = {kind: 'move', fx: p.X ?? pos.x, fy: p.Y ?? pos.y, fz: p.Z ?? pos.z, f: (p.F ?? this.feed)/60};
+      if (p.F) this.feed = p.F;
+    } else if (cmd === 'G38.2' || cmd === 'G38.3') {
+      const pos = this.pos();
+      const axis = p.Z !== undefined ? 'z' : (p.X !== undefined ? 'x' : 'y');
+      this.cur = {kind: 'probe', axis,
+        fx: p.X ?? pos.x, fy: p.Y ?? pos.y, fz: p.Z ?? pos.z, f: this.probeFeed/60};
+    } else if (cmd === 'M117') { gmon(str); log('M117 ' + parts.slice(1).join(' ')); this.cur = null; }
+    else if (cmd === 'G4') { this.cur = {kind: 'dwell', t: (p.P ?? 0)/1000}; }
+    else if (cmd === 'T0' || cmd === 'T1') {
+      const h = cmd === 'T0' ? 'A' : 'B';
+      // nasty case: the ball gets bumped WHILE the head switches (table/wire knocked)
+      if (cmd === 'T1' && this.bump) {
+        const a2 = rng()*Math.PI*2;
+        ball.x += Math.cos(a2)*this.bump; ball.y += Math.sin(a2)*this.bump;
+        log(`⚠ EXTERNAL: ball bumped by ${this.bump}mm at the head switch — the algorithm does NOT know`, 'bad');
+      }
+      this.active = h;
+      log(`--- carriage ${h} ---`, 'warn');
+      this.cur = null;
+    } else { this.cur = null; }
+    gmon(null, str);
+  },
+  step(dt) {
+    if (!this.cur) return true;
+    const c = this.cur;
+    if (c.kind === 'dwell') { c.t -= dt; return c.t <= 0; }
+    const pos = this.pos();
+    let step = c.f * dt;
+    // vertical probing: the descent animates at the real probe speed (F240=4mm/s),
+    // the contact is exact analytics: reach the contact height and record
+    if (c.kind === 'probe' && c.axis === 'z' && c.fz < pos.z) {
+      const w = this.world();
+      const hit = this.verticalProbe(w.x, w.y, pos.z, c.fz);
+      const targetZ = hit ? hit.z : c.fz;
+      let step = c.f * dt;
+      if (step > 0 && pos.z - targetZ > step) {
+        // still descending
+        this.beam.z = pos.z - step;
+        this.dist += step;
+        return false;
+      }
+      let res;
+      if (this.noise && rng() < this.noisePct/100) {
+        // false click: do NOT move the head (readout glitch, not a physical stop) -
+        // otherwise a teleport to the false depth lands inside the ball
+        res = {triggered: true, x: pos.x, y: pos.y, z: pos.z, el: 'glitch'};
+        this.bad++; this.clicks++;
+        mark(w.x, w.y, 42, 0x884444);
+        log(`✗ glitch (false click) at ${pos.x.toFixed(1)},${pos.y.toFixed(1)}`, 'bad');
+      } else if (hit) {
+        res = {triggered: true, x: pos.x, y: pos.y, z: hit.z, el: hit.el};
+        this.clicks++;
+        const good = hit.el === 'nozzle';
+        if (!good) this.bad++;
+        mark(w.x, w.y, hit.z, good ? 0x3fd35f : 0xff5a3d);
+        log(`${good?'🔵':'🔴'} ${hit.el} Z=${hit.z.toFixed(2)} at ${pos.x.toFixed(1)},${pos.y.toFixed(1)}`, good?'good':'bad');
+      } else res = {triggered: false, x: pos.x, y: pos.y, z: c.fz};
+      // real click: lever pre-travel (Z trigger lag) + X/Y slop
+      if (res.triggered && res.el !== 'glitch') {
+        res = {triggered: true, el: res.el,
+          x: pos.x + (rng()-0.5)*2*this.jit,
+          y: pos.y + (rng()-0.5)*2*this.jit,
+          z: res.z - this.pre};
+      }
+      this.dist += Math.max(0, pos.z - res.z);
+      this.beam.z = Math.max(res.z, c.fz);
+      this.lastProbe = res;
+      return true;
+    }
+    // moves and lateral probing: sub-steps with accumulated progress
+    // (position = start + direction * done - no sawtooth back-jumps)
+    const sTo = {x: c.fx, y: c.fy, z: c.fz};
+    const dx = sTo.x - pos.x, dy = sTo.y - pos.y, dz = sTo.z - pos.z;
+    const len = Math.hypot(dx, dy, dz);
+    if (len < 0.01) { this.setPos(sTo.x, sTo.y, sTo.z); return true; }
+    let prevGap = this.minGap().gap;
+    let done = 0;
+    while (done < len - 1e-9 && step > 0) {
+      // large safe step: the whole head is above the ball top and not descending
+      const wNow = this.world();
+      const above = (wNow.z - (BALL_CZ + BALL_R) > 1) && dz >= -1e-9;
+      const chunk = (above || prevGap > 30) ? 25 : 0.5;
+      const s = Math.min(step, chunk, len - done);
+      done += s; step -= s;
+      this.setPos(pos.x + dx/len*done, pos.y + dy/len*done, pos.z + dz/len*done);
+      this.dist += s;
+      const g = this.minGap();
+      if (g.gap <= 0 && g.gap < prevGap - 1e-6) {
+        if (c.kind === 'probe' && g.el === 'nozzle') {
+          this.clicks++;
+          const w = this.world();
+          mark(w.x, w.y, pos.z + dz/len*done, 0x3fd35f);
+          log(`🔵 nozzle (lateral) at carriage X${this.pos().x.toFixed(1)} Z${(pos.z + dz/len*done).toFixed(2)}`, 'good');
+          this.lastProbe = {triggered: true, x: this.pos().x, y: this.pos().y, z: this.pos().z, el: 'nozzle'};
+          return true;
+        } else if (c.kind === 'probe') {
+          this.pushBallAway(g.ex, g.ey, g.el);
+          this.lastProbe = {triggered: true, x: this.pos().x, y: this.pos().y, z: this.pos().z, el: g.el};
+          return true;
+        } else {
+          // travel into the ball: the ball gets moved - a failure; the command is NOT aborted
+          this.pushBallAway(g.ex, g.ey, g.el);
+          prevGap = this.minGap().gap;
+          this.lastProbe = null;
+        }
+      } else prevGap = g.gap;
+    }
+    if (c.kind === 'probe') this.lastProbe = {triggered: false, x: this.pos().x, y: this.pos().y, z: this.pos().z};
+    return done >= len - 1e-9;
+  }
+};
+// =====================================================================
+//  State + log
+// =====================================================================
+const S = {running: false, fast: false, gen: null, status: 'idle',
+  logbuf: [], apexA: null, apexB: null, eoff: null, eoffErr: null,
+  marks: [], pathA: [], pathB: []};
+function log(msg, cls='info') {
+  S.logbuf.push(msg);
+  const d = document.createElement('div');
+  d.className = cls; d.textContent = msg;
+  const L = document.getElementById('log');
+  L.prepend(d);
+  while (L.children.length > 2500) L.lastChild.remove();
+}
+function gmon(line, cur) {
+  const el = document.getElementById('gmon');
+  if (line !== null && line !== undefined) el._lines = (el._lines || []).concat([line]).slice(-16);
+  el._cur = cur === undefined ? null : cur;
+  el.innerHTML = ((el._lines || []).concat(el._cur ? ['<b style="color:#ffd479">' + el._cur + '</b>'] : [])).join('\n');
+  el.scrollTop = el.scrollHeight;
+}
+function mark(wx, wy, z, color) { S.marks.push({wx, wy, z, color}); }
+// LSQ sphere fit + RANSAC
+function fitSphere(pts) {
+  const n = pts.length;
+  if (n < 4) return null;
+  const A = [], bv = [];
+  for (const p of pts) { A.push([2*p.x, 2*p.y, 2*p.z, 1]); bv.push(p.x*p.x + p.y*p.y + p.z*p.z); }
+  const Mx = [[0,0,0,0,0],[0,0,0,0,0],[0,0,0,0,0],[0,0,0,0,0]];
+  for (let i = 0; i < 4; i++) {
+    for (let j = 0; j < 4; j++) { let s = 0; for (let k = 0; k < n; k++) s += A[k][i]*A[k][j]; Mx[i][j] = s; }
+    let s = 0; for (let k = 0; k < n; k++) s += A[k][i]*bv[k]; Mx[i][4] = s;
+  }
+  for (let col = 0; col < 4; col++) {
+    let piv = col;
+    for (let r2 = col+1; r2 < 4; r2++) if (Math.abs(Mx[r2][col]) > Math.abs(Mx[piv][col])) piv = r2;
+    [Mx[col], Mx[piv]] = [Mx[piv], Mx[col]];
+    if (Math.abs(Mx[col][col]) < 1e-9) return null;
+    for (let r2 = col+1; r2 < 4; r2++) { const f = Mx[r2][col]/Mx[col][col]; for (let c2 = col; c2 < 5; c2++) Mx[r2][c2] -= f*Mx[col][c2]; }
+  }
+  const sol = [0,0,0,0];
+  for (let r2 = 3; r2 >= 0; r2--) { let s = Mx[r2][4]; for (let c2 = r2+1; c2 < 4; c2++) s -= Mx[r2][c2]*sol[c2]; sol[r2] = s/Mx[r2][r2]; }
+  const cx = sol[0], cy = sol[1], cz = sol[2];
+  const r2 = sol[3] + cx*cx + cy*cy + cz*cz;
+  if (r2 <= 0) return null;
+  return {cx, cy, cz, r: Math.sqrt(r2)};
+}
+const resid = (p, f) => Math.abs(Math.hypot(p.x-f.cx, p.y-f.cy, p.z-f.cz) - f.r);
+function sphereRANSAC(pts) {
+  if (pts.length < 4) return null;
+  let bestSet = null, bestCount = -1;
+  for (let it = 0; it < 80; it++) {
+    const idx = [];
+    while (idx.length < 4) { const i = Math.floor(rng()*pts.length); if (!idx.includes(i)) idx.push(i); }
+    const f = fitSphere(idx.map(i=>pts[i]));
+    if (!f || f.r < BALL_R-0.6 || f.r > BALL_R+0.6) continue;
+    const inl = pts.filter(p => resid(p, f) < 0.2);
+    if (inl.length > bestCount) { bestCount = inl.length; bestSet = inl; }
+  }
+  if (!bestSet || bestSet.length < 4) return fitSphere(pts);
+  return fitSphere(bestSet);
+}
+// =====================================================================
+//  ALGORITHM v8 = a G-code generator (v7 port + IDEX parking).
+//  Lateral nozzle presses happen only after the sphere fit.
+// =====================================================================
+function* travel(x, y, z = 60) { yield `G0 Z${z.toFixed(1)}`; yield `G0 X${x.toFixed(2)} Y${y.toFixed(2)}`; }
+// Run config: the ball top height is NOT known to the algorithm upfront (minimal setup).
+// It can be provided externally to speed things up (?bt=49.5); otherwise the first pass
+// runs at the conservative height 56 (above any ball up to D15), measures the top itself
+// and prints the discovered config value. Ball XY is deliberately never saved.
+const RUN_CFG = {ballTop: null};
+function* press(x, y) {
+  const sz = RUN_CFG.ballTop !== null ? RUN_CFG.ballTop + 2.5 : 56;
+  yield* travel(x, y, sz);
+  return yield `G38.2 Z39 F240`;
+}
+function* algoSphere() {
+  const clx = x => Math.max(60, Math.min(BED.w-60, x));
+  const cly = y => Math.max(15, Math.min(BED.h-15, y));
+  let head = 'A', stage = 0; // 0=A(scan) 1=B 2=revision A
+  S._samples = {A: [], B: []};
+  let best = {x: START.x, y: START.y, z: -1, el: null};
+  const updBest = r => { if (r && r.triggered && r.el !== 'glitch' && r.z > best.z) best = {x: r.x, y: r.y, z: r.z, el: r.el}; };
+  while (true) {
+    if (head === 'A' && stage === 2) {
+      // --- revision A: approach the previous apex, seed press + helpers ---
+      yield `G0 Z60`;
+      yield `G0 X${S.apexA.x.toFixed(2)} Y${S.apexA.y.toFixed(2)}`;
+      let r0 = yield `G38.2 Z39 F240`;
+      if (!(r0 && r0.triggered && r0.el !== 'glitch')) {
+        for (const [dx, dy] of [[4,0],[-4,0],[0,4],[0,-4]]) {
+          r0 = yield* press(S.apexA.x+dx, S.apexA.y+dy);
+          if (r0 && r0.triggered && r0.el !== 'glitch') break;
+        }
+      }
+      if (r0 && r0.triggered && r0.el !== 'glitch') updBest(r0);
+      else best = {x: S.apexA.x, y: S.apexA.y, z: -1, el: null};
+    } else if (head === 'A') {
+      // --- phase 1: blind scan of the zone reachable by carriage A (B parked right) ---
+      const hear = geo.rb + BALL_R;
+      const pitch = Math.max(8, Math.min(20, Math.floor(hear*1.35)));
+      const xMax = M.carr.B - SPACING - 4; // physical limit of carriage A
+      const xs = [], ys = [];
+      for (let x = 12; x <= xMax; x += pitch) xs.push(x);
+      for (let y = 12; y <= BED.h-8; y += pitch) ys.push(y);
+      // boustrophedon: rows ordered by proximity, direction alternates within a row.
+      // Fewer idle jumps than sorting by distance from the start
+      ys.sort((a,b)=>Math.abs(a-START.y)-Math.abs(b-START.y));
+      const pts = [];
+      let flip = START.x > (xs[0] + xs[xs.length-1]) / 2;
+      for (const ry of ys) {
+        const row = xs.slice();
+        if (flip) row.reverse();
+        for (const rx of row) pts.push([rx, ry]);
+        flip = !flip;
+      }
+      yield `M117 blind ball search (grid ${pitch}mm, zone A up to X${xMax})`;
+      for (const [x, y] of pts) {
+        const r = yield* press(x, y);
+        if (r && r.triggered && r.el !== 'glitch') { updBest(r); break; }
+      }
+    } else {
+      // --- head B: A is already parked left by the code below; B drives to apex A ---
+      yield `T1`;
+      yield `G0 Z60`;
+      yield `G0 X${S.apexA.x.toFixed(2)} Y${S.apexA.y.toFixed(2)}`;
+      let r = yield `G38.2 Z39 F240`;
+      if (!(r && r.triggered && r.el !== 'glitch')) {
+        for (const [dx, dy] of [[6,0],[-6,0],[0,6],[0,-6]]) {
+          r = yield* press(S.apexA.x+dx, S.apexA.y+dy);
+          if (r && r.triggered && r.el !== 'glitch') break;
+        }
+      }
+      if (r && r.triggered && r.el !== 'glitch') updBest(r);
+      else best = {x: S.apexA.x, y: S.apexA.y, z: -1, el: null};
+    }
+    // --- phase 2: hill climb ---
+    yield `M117 hill climb`;
+    let cur = best, d = 4, vretry = 0, fittry = 0, fit = null;
+    const samples = () => S._samples[head];
+    climb: while (true) {
+      const probes = [];
+      for (const [dx, dy] of [[1,0],[-1,0],[0,1],[0,-1]]) {
+        const r = yield* press(clx(cur.x+dx*d), cly(cur.y+dy*d));
+        if (r && r.triggered && r.el !== 'glitch') { samples().push({x:r.x, y:r.y, z:r.z, el:r.el}); probes.push(r); updBest(r); }
+      }
+      let up = null;
+      for (const r of probes) if (r.z > cur.z + 0.03 && (!up || r.z > up.z)) up = r;
+      if (up) { cur = up; d = Math.min(4, d*1.5); continue; }
+      const top = probes.reduce((a, s) => (!a || s.z > a.z) ? s : a, null);
+      const eq = probes.some(s => Math.abs(s.z - cur.z) <= 0.03);
+      if (eq && top && top.el === 'nozzle') break climb;
+      if (!eq && d > 0.7) { d /= 2; continue; }
+      let escaped = null;
+      for (const rr of [5, 9, 14, 20]) {
+        for (let k = 0; k < 8 && !escaped; k++) {
+          const a = k/8*2*Math.PI;
+          const r = yield* press(clx(cur.x+rr*Math.cos(a)), cly(cur.y+rr*Math.sin(a)));
+          if (r && r.triggered && r.el !== 'glitch') {
+            samples().push({x:r.x, y:r.y, z:r.z, el:r.el}); updBest(r);
+            // early exit: a nozzle point is always on the sphere; clearly higher is an escape too
+            if (r.el === 'nozzle' || r.z > cur.z + 0.3) escaped = r;
+          }
+        }
+      }
+      if (escaped) { cur = escaped; d = 4; continue climb; }
+      const offs2 = [];
+      for (const e of els(head === 'B')) {
+        if (e.dx === 0 && e.dy === 0) continue;
+        if (!offs2.some(o2 => o2[0] === e.dx && o2[1] === e.dy)) offs2.push([e.dx, e.dy]);
+      }
+      let jumped = null;
+      for (const [dx, dy] of offs2) {
+        const r = yield* press(clx(cur.x+dx), cly(cur.y+dy));
+        if (r && r.triggered && r.el !== 'glitch') { samples().push({x:r.x, y:r.y, z:r.z, el:r.el}); updBest(r);
+          if (r.el === 'nozzle' || r.z > cur.z - 1.0) jumped = r; }
+        if (jumped) break; // early exit: the jump worked
+      }
+      if (jumped) { cur = jumped; d = 2; continue climb; }
+      break climb;
+    }
+    // --- phase 3: sphere + verification ---
+    yield `M117 sphere: point rings`;
+    const ringFit = function* (cx, cy, radii) {
+      for (const rr of radii) for (let k = 0; k < 6; k++) {
+        const a = k/6*2*Math.PI + (rr > 3 ? Math.PI/6 : 0);
+        const r = yield* press(clx(cx+rr*Math.cos(a)), cly(cy+rr*Math.sin(a)));
+        if (r && r.triggered && r.el === 'nozzle') samples().push({x:r.x, y:r.y, z:r.z, el:r.el});
+      }
+    };
+    const tryFit = () => {
+      const f = sphereRANSAC(samples().filter(s => s.el === 'nozzle'));
+      return (f && f.r > BALL_R-0.6 && f.r < BALL_R+0.6) ? f : null;
+    };
+    let center = {x: best.x, y: best.y};
+    fit = null;
+    yield* ringFit(center.x, center.y, [BALL_R*0.52, BALL_R*0.86]);
+    fit = tryFit();
+    if (!fit && fittry < 1 && best.z > 0) { fittry++; yield* ringFit(best.x, best.y, [BALL_R*0.3, BALL_R*0.64, BALL_R]); fit = tryFit(); }
+    let apex;
+    // verification press with glitch protection: a glitch is not a sphere mismatch,
+    // just repeat the press (up to 3 times)
+    const verifiedPress = function* (x, y) {
+      let r = null;
+      for (let t = 0; t < 3 && !(r && r.triggered && r.el === 'nozzle'); t++)
+        r = yield* press(x, y);
+      return r;
+    };
+    if (fit) {
+      yield `M117 verify at sphere center`;
+      const vr = yield* verifiedPress(clx(fit.cx), cly(fit.cy));
+      if (vr && vr.triggered && vr.el === 'nozzle' && Math.abs(vr.z - (fit.cz + fit.r)) <= 0.15) {
+        log(`verify: nozzle Z=${vr.z.toFixed(2)} = sphere ${(fit.cz+fit.r).toFixed(2)} - ok`, 'good');
+        apex = {x: fit.cx, y: fit.cy, z: fit.cz + fit.r};
+      } else if (vretry < 2) {
+        vretry++;
+        yield* ringFit(fit.cx, fit.cy, [BALL_R*0.3, BALL_R*0.64, BALL_R]);
+        const f2 = tryFit();
+        const vr2 = f2 ? yield* verifiedPress(clx(f2.cx), cly(f2.cy)) : null;
+        if (f2 && vr2 && vr2.triggered && vr2.el === 'nozzle' && Math.abs(vr2.z - (f2.cz+f2.r)) <= 0.15) {
+          apex = {x: f2.cx, y: f2.cy, z: f2.cz + f2.r};
+        } else { log('verify failed - falling back to best click', 'bad'); fit = null; }
+      } else { log('verify failed - falling back to best click', 'bad'); fit = null; }
+    }
+    if (!fit) apex = {x: best.x, y: best.y, z: best.z};
+    if (head === 'A' && stage === 0) {
+      S.apexA = apex;
+      log(`Apex (head A): X${apex.x.toFixed(2)} Y${apex.y.toFixed(2)} Z${apex.z.toFixed(2)}`, 'good');
+      // ball top measured - use it to speed up the following passes
+      if (RUN_CFG.ballTop === null) {
+        RUN_CFG.ballTop = apex.z;
+        log(`⚙ SPEED-UP CONFIG (set for next runs): bt=${apex.z.toFixed(2)} - ball top height; ball XY is NOT saved`, 'warn');
+      }
+      // park A left and activate B - explicit G-code only, at a safe Z
+      yield `G0 Z60`;
+      yield `G0 X${PARK_A} Y${S.apexA.y.toFixed(2)}`;
+      stage = 1; head = 'B'; best = {x: 0, y: 0, z: -1, el: null};
+      continue;
+    } else if (head === 'B') {
+      S.apexB = apex;
+      log(`Apex (head B): X${apex.x.toFixed(2)} Y${apex.y.toFixed(2)} Z${apex.z.toFixed(2)}`, 'good');
+      // REVISION A: the ball may have been bumped at the head switch (or later) -
+      // re-measure A and take the offset from the closest-in-time measurement
+      yield `G0 Z60`;
+      yield `G0 X${PARK_B} Y${S.apexA.y.toFixed(2)}`;
+      yield `T0`;
+      S._samples = {A: [], B: S._samples.B}; // fresh samples for the revision
+      stage = 2; head = 'A'; best = {x: 0, y: 0, z: -1, el: null};
+      continue;
+    } else {
+      // final: revision A done
+      const apexA2 = apex;
+      log(`Apex (head A, revision): X${apexA2.x.toFixed(2)} Y${apexA2.y.toFixed(2)} Z${apexA2.z.toFixed(2)}`, 'good');
+      const drift = Math.hypot(apexA2.x-S.apexA.x, apexA2.y-S.apexA.y, apexA2.z-S.apexA.z);
+      if (drift > 0.2) log(`⚠ ball moved between passes (drift ${drift.toFixed(2)}mm) - offset from revision`, 'warn');
+      else log(`ball drift between passes: ${drift.toFixed(2)}mm - stable`, 'info');
+      S.eoff = {dx: S.apexB.x - apexA2.x, dy: S.apexB.y - apexA2.y, dz: S.apexB.z - apexA2.z};
+      // true TOOL offset: how much B commands differ from A commands
+      // for the nozzles to coincide: (ball-nB) - (ball-nA) = nA - nB
+      const trueOff = {dx: nA.x - nB.x, dy: nA.y - nB.y, dz: nA.z - nB.z};
+      const e = {dx: S.eoff.dx - trueOff.dx, dy: S.eoff.dy - trueOff.dy, dz: S.eoff.dz - trueOff.dz};
+      S.eoffErr = e;
+      log(`MEASURED B offset: dX=${S.eoff.dx.toFixed(3)} dY=${S.eoff.dy.toFixed(3)} dZ=${S.eoff.dz.toFixed(3)}`, 'warn');
+      log(`TRUE B offset:      dX=${trueOff.dx.toFixed(3)} dY=${trueOff.dy.toFixed(3)} dZ=${trueOff.dz.toFixed(3)}`, 'info');
+      log(`offset error: dX ${e.dx.toFixed(3)} dY ${e.dy.toFixed(3)} dZ ${e.dz.toFixed(3)}`,
+        Math.abs(e.dx)<0.5 && Math.abs(e.dy)<0.5 && Math.abs(e.dz)<0.5 ? 'good' : 'bad');
+      yield `M117 B offset: dX=${S.eoff.dx.toFixed(3)} dY=${S.eoff.dy.toFixed(3)} dZ=${S.eoff.dz.toFixed(3)}`;
+      return;
+    }
+  }
+}
+// =====================================================================
+//  3D scene: StealthBurner STL (VoronDesign, CC-BY-NC-SA) as the shell +
+//  a procedural hotend. Collisions are computed by the invisible els() primitives.
+// =====================================================================
+const view = document.getElementById('view');
+const renderer = new THREE.WebGLRenderer({antialias: true});
+renderer.setSize(view.clientWidth, view.clientHeight);
+renderer.setPixelRatio(devicePixelRatio);
+view.appendChild(renderer.domElement);
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x1e222a);
+scene.fog = new THREE.Fog(0x1e222a, 700, 1600);
+const camera = new THREE.PerspectiveCamera(45, view.clientWidth/view.clientHeight, 0.1, 5000);
+camera.position.set(320, 420, 520);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(BED.w/2, 45, BED.h/2);
+controls.enableDamping = true;
+scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+const dl = new THREE.DirectionalLight(0xffffff, 1.4); dl.position.set(300, 500, 200); scene.add(dl);
+const dl2 = new THREE.DirectionalLight(0x88aaff, 0.5); dl2.position.set(-300, 300, -200); scene.add(dl2);
+// bed + grid
+const bedMesh = new THREE.Mesh(new THREE.BoxGeometry(BED.w, 3, BED.h),
+  new THREE.MeshStandardMaterial({color: 0x2a3040, roughness: .85}));
+bedMesh.position.set(BED.w/2, 39.5 - 1.5, BED.h/2); scene.add(bedMesh);
+const grid = new THREE.GridHelper(Math.max(BED.w, BED.h), Math.max(BED.w, BED.h)/10, 0x3a4356, 0x272e3c);
+grid.position.set(BED.w/2, 39.55, BED.h/2); scene.add(grid);
+// X gantry rail (visual): the carriages ride it
+const rail = new THREE.Mesh(new THREE.BoxGeometry(BED.w + 60, 8, 8),
+  new THREE.MeshStandardMaterial({color: 0x556077, metalness: .6, roughness: .3}));
+scene.add(rail);
+const parkAMesh = mkLabel('A ⟷', '#ffffff'), parkBMesh = mkLabel('⟷ B', '#6aa8ff');
+function mkLabel(text, color) {
+  const c = document.createElement('canvas'); c.width = 128; c.height = 64;
+  const g = c.getContext('2d');
+  g.font = 'bold 40px system-ui'; g.fillStyle = color; g.textAlign = 'center'; g.fillText(text, 64, 46);
+  const t = new THREE.CanvasTexture(c);
+  const s = new THREE.Sprite(new THREE.SpriteMaterial({map: t, transparent: true}));
+  s.scale.set(40, 20, 1); scene.add(s); return s;
+}
+// ball
+const ballMesh = new THREE.Mesh(new THREE.SphereGeometry(BALL_R, 32, 24),
+  new THREE.MeshStandardMaterial({color: 0xd9a04a, metalness: .3, roughness: .35}));
+scene.add(ballMesh);
+// StealthBurner shell (STL) - shared by both heads, tinted differently
+let sbGeometry = null;
+try {
+  sbGeometry = new STLLoader().parse(await (await fetch('./stealthburner_body.stl')).arrayBuffer());
+  sbGeometry.computeBoundingBox();
+  const bb = sbGeometry.boundingBox;
+  // the SB nozzle is the narrow +Y end of the STL: the tip-section center = nozzle axis
+  const pos = sbGeometry.attributes.position;
+  const yTip = bb.max.y, L = bb.max.y - bb.min.y;
+  let tx0 = 1e9, tx1 = -1e9, tz0 = 1e9, tz1 = -1e9;
+  for (let i = 0; i < pos.count; i++) {
+    if (pos.getY(i) > yTip - L*0.015) {
+      tx0 = Math.min(tx0, pos.getX(i)); tx1 = Math.max(tx1, pos.getX(i));
+      tz0 = Math.min(tz0, pos.getZ(i)); tz1 = Math.max(tz1, pos.getZ(i));
+    }
+  }
+  const tipX = (tx0+tx1)/2, tipZ = (tz0+tz1)/2;
+  sbGeometry.rotateZ(Math.PI);            // nozzle -> down (world -Y), front preserved
+  sbGeometry.translate(tipX, yTip, -tipZ); // nozzle axis at group origin, shell upward
+  // mirror the shell: variant from ?mirror= (x | z | none), default z (depth).
+  // Mirroring flips triangle winding - swap vertices 1<->2
+  {
+    const mv = new URLSearchParams(location.search).get('mirror') || 'z';
+    if (mv === 'x' || mv === 'z') {
+      const C = mv === 'x' ? 'X' : 'Z';
+      const pa = sbGeometry.attributes.position, na = sbGeometry.attributes.normal;
+      for (let i = 0; i < pa.count; i++) {
+        pa['set'+C](i, -pa['get'+C](i));
+        na['set'+C](i, -na['get'+C](i));
+      }
+      for (let t = 0; t < pa.count; t += 3) {
+        for (const attr of [pa, na]) {
+          const x1 = attr.getX(t+1), y1 = attr.getY(t+1), z1 = attr.getZ(t+1);
+          attr.setXYZ(t+1, attr.getX(t+2), attr.getY(t+2), attr.getZ(t+2));
+          attr.setXYZ(t+2, x1, y1, z1);
+        }
+      }
+      pa.needsUpdate = true; na.needsUpdate = true;
+    }
+  }
+  log(`StealthBurner STL loaded: ${(bb.max.x-bb.min.x).toFixed(0)}×${L.toFixed(0)}×${bb.max.z-bb.min.z}mm, nozzle located by taper`, 'info');
+} catch (e) { log('StealthBurner STL failed to load: ' + e.message + ' — heads fall back to primitives', 'warn'); }
+// Clockwork2 (extruder) - Direct Drive parts, each centered on its bbox
+let cwGeoms = null;
+try {
+  const names = ['cw_main_body', 'cw_motor_plate', 'cw_[a]_guidler_a', 'cw_[a]_guidler_b', 'cw_[a]_latch', 'cw_[a]_latch_shuttle'];
+  cwGeoms = {};
+  for (const n of names) {
+    const g = new STLLoader().parse(await (await fetch('./' + n + '.stl')).arrayBuffer());
+    g.computeBoundingBox();
+    const b2 = g.boundingBox;
+    g.translate(-(b2.min.x+b2.max.x)/2, -(b2.min.y+b2.max.y)/2, -(b2.min.z+b2.max.z)/2);
+    g.rotateY(Math.PI/2); // CW2 STL: long Y axis -> world vertical (assembly along SB)
+    cwGeoms[n] = g;
+  }
+  log('Clockwork2 STL loaded (6 extruder parts)', 'info');
+} catch (e) { log('Clockwork2 failed to load: ' + e.message, 'warn'); cwGeoms = null; }
+function mkFan(r) {
+  // fan, axis along Z: ring shroud + hub + rotor in the XY plane
+  // (blades distributed by Z rotation, pitch around the radial X axis)
+  const fan = new THREE.Group();
+  const dark = new THREE.MeshStandardMaterial({color: 0x22262e, roughness: .8});
+  const shroud = new THREE.Mesh(
+    new THREE.CylinderGeometry(r*1.08, r*1.08, 10, 28, 1, true),
+    new THREE.MeshStandardMaterial({color: 0x2a2f38, roughness: .8, side: THREE.DoubleSide}));
+  shroud.rotation.x = Math.PI/2;
+  fan.add(shroud);
+  const hub = new THREE.Mesh(new THREE.CylinderGeometry(r*0.32, r*0.32, 11, 14), dark);
+  hub.rotation.x = Math.PI/2; fan.add(hub);
+  const rotor = new THREE.Group();
+  const bladeMat = new THREE.MeshStandardMaterial({color: 0x50555f, roughness: .6, side: THREE.DoubleSide});
+  for (let i = 0; i < 9; i++) {
+    const arm = new THREE.Group();
+    arm.rotation.z = i/9*2*Math.PI;
+    const b = new THREE.Mesh(new THREE.BoxGeometry(r*0.62, r*0.3, 1.2), bladeMat);
+    b.position.x = r*0.62;
+    b.rotation.x = 0.55; // blade pitch
+    arm.add(b); rotor.add(arm);
+  }
+  fan.add(rotor);
+  fan.userData.rotor = rotor;
+  return fan;
+}
+function buildHead(isB) {
+  const g = new THREE.Group();
+  const mat = c => new THREE.MeshStandardMaterial({color: c, roughness: .55, metalness: .25});
+  const d = isB ? geo.bl : 0;
+  // --- hotend: nozzle cone, heater block with cartridge, heatsink ---
+  const nozzle = new THREE.Mesh(new THREE.ConeGeometry(1.4, 4, 16), mat(0xc8a8d0));
+  nozzle.rotation.x = Math.PI; nozzle.position.y = 2; g.add(nozzle);
+  const hblock = new THREE.Mesh(new THREE.BoxGeometry(16, 6, 12), mat(0x996633));
+  hblock.position.y = 6; g.add(hblock);
+  const cart = new THREE.Mesh(new THREE.CylinderGeometry(1, 1, 20, 8), mat(0x707582));
+  cart.rotation.z = Math.PI/2; cart.position.set(2, 6.5, 5); g.add(cart);
+  const sink = new THREE.Group();
+  for (let i = 0; i < 6; i++) {
+    const fin = new THREE.Mesh(new THREE.CylinderGeometry(6, 6, 1, 14), mat(0xb8bec9));
+    fin.position.y = 10 + i*1.8; sink.add(fin);
+  }
+  g.add(sink);
+  if (sbGeometry) {
+    // SB shell (printed head); B's shroud sits lower by bl - drop it visually
+    const body = new THREE.Mesh(sbGeometry, mat(isB ? 0x5a86c8 : 0xd8dde6));
+    body.position.y = 10 + d;
+    g.add(body);
+  } else {
+    const sock = new THREE.Mesh(new THREE.CylinderGeometry(geo.rs, geo.rs, 2, 24), mat(0x777788));
+    sock.position.y = geo.zs + d + 1; g.add(sock);
+    const block = new THREE.Mesh(new THREE.CylinderGeometry(geo.rb, geo.rb, 3, 24), mat(0x996633));
+    block.position.y = geo.zb + d + 1.5; g.add(block);
+    for (const s of [-1, 1]) {
+      const duct = new THREE.Mesh(new THREE.CylinderGeometry(4, 4, 2.5, 16), mat(0x556077));
+      duct.position.set(s*geo.dd, geo.zd + d + 1.25, 0); g.add(duct);
+    }
+  }
+  // --- Clockwork2 extruder on the SB rear face + stepper ---
+  if (cwGeoms) {
+    const cwColor = isB ? 0x45699e : 0xb8c0cc;
+    const ex = new THREE.Group();
+    const body2 = new THREE.Mesh(cwGeoms['cw_main_body'], mat(cwColor));
+    ex.add(body2);
+    const plate = new THREE.Mesh(cwGeoms['cw_motor_plate'], mat(0x3a3f49));
+    plate.position.z = -17; ex.add(plate);
+    // NEMA14 pancake behind the plate
+    const motor = new THREE.Mesh(new THREE.BoxGeometry(35, 35, 22), mat(0x2c3038));
+    motor.position.z = -32; ex.add(motor);
+    const shaft = new THREE.Mesh(new THREE.CylinderGeometry(2, 2, 8, 10), mat(0xc0c6d0));
+    shaft.rotation.x = Math.PI/2; shaft.position.z = -20; ex.add(shaft);
+    // guidlers and latches at the extruder front
+    const ga = new THREE.Mesh(cwGeoms['cw_[a]_guidler_a'], mat(0xd98a3d));
+    ga.position.set(0, -18, 8); ex.add(ga);
+    const gb = new THREE.Mesh(cwGeoms['cw_[a]_guidler_b'], mat(0xd98a3d));
+    gb.position.set(0, -18, 12); ex.add(gb);
+    const latch = new THREE.Mesh(cwGeoms['cw_[a]_latch'], mat(0xffd479));
+    latch.position.set(20, 22, 4); ex.add(latch);
+    const shuttle = new THREE.Mesh(cwGeoms['cw_[a]_latch_shuttle'], mat(0xc8c030));
+    shuttle.position.set(-20, 20, 4); ex.add(shuttle);
+    ex.position.set(0, 92 + d, -28); // behind SB, upper half
+    g.add(ex);
+  }
+  // --- fans: front one in the SB nose + rear one on the motor ---
+  // front 4010: opening center by render trial and error: y=38.4
+  // (46.8 - too high, 30 - too low; halved the drop), x=3, face z=25.2
+  const fanFront = mkFan(15.5);
+  fanFront.position.set(3, 38.4 + d, 24); g.add(fanFront);
+  const fanRear = mkFan(13);
+  fanRear.position.set(0, 52 + d, -12); g.add(fanRear);
+  g.userData.fans = [fanFront, fanRear];
+  if (!isB && document.getElementById('pin').checked) {
+    const pin = new THREE.Mesh(new THREE.CylinderGeometry(0.6, 0.6, 2.5, 8), mat(0xffd479));
+    pin.position.set(-6, geo.zp + 1.25, 4); g.add(pin);
+  }
+  return g;
+}
+let headMeshA = buildHead(false), headMeshB = buildHead(true);
+scene.add(headMeshA, headMeshB);
+// trails and marks
+const trailA = new THREE.Line(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({color: 0xffffff, transparent: true, opacity: .45}));
+const trailB = new THREE.Line(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({color: 0x6aa8ff, transparent: true, opacity: .45}));
+scene.add(trailA, trailB);
+const marksGroup = new THREE.Group(); scene.add(marksGroup);
+function syncScene() {
+  ballMesh.position.set(ball.x, BALL_CZ, ball.y);
+  // rotors spin fast on the ACTIVE head while a run is in progress
+  for (const h of [headMeshA, headMeshB]) {
+    const on = S.running && ((h === headMeshA) === (M.active === 'A'));
+    for (const f of (h.userData.fans || [])) f.userData.rotor.rotation.z += on ? 0.9 : 0.08;
+  }
+  // world nozzles (carriage + nozzle offset)
+  const a = {x: M.carr.A + nA.x, y: M.beam.y + nA.y, z: M.beam.z + nA.z};
+  const b = {x: M.carr.B + nB.x, y: M.beam.y + nB.y, z: M.beam.z + nB.z};
+  headMeshA.position.set(a.x, a.z, a.y);
+  headMeshB.position.set(b.x, b.z, b.y);
+  headMeshB.traverse(o => { if (o.isMesh) { o.material.transparent = M.active === 'B'; o.material.opacity = M.active === 'B' ? 1 : 0.4; } });
+  headMeshA.traverse(o => { if (o.isMesh) { o.material.transparent = M.active === 'A'; o.material.opacity = M.active === 'A' ? 1 : 0.4; } });
+  // the X rail sits BEHIND the heads: they hang on its front face
+  rail.position.set(BED.w/2, M.beam.z + 85, M.beam.y - 22);
+  parkAMesh.position.set(PARK_A, 100, M.beam.y - 45);
+  parkBMesh.position.set(PARK_B, 100, M.beam.y - 45);
+  const push = (arr, line, x, y, z) => {
+    arr.push(x, y, z);
+    if (arr.length > 3*4000) arr.splice(0, 3);
+    line.geometry.setAttribute('position', new THREE.Float32BufferAttribute(arr, 3));
+  };
+  push(S.pathA, trailA, a.x, a.z, a.y);
+  push(S.pathB, trailB, b.x, b.z, b.y);
+  while (marksGroup.children.length < S.marks.length) {
+    marksGroup.add(new THREE.Mesh(new THREE.SphereGeometry(0.9, 8, 6), new THREE.MeshBasicMaterial()));
+  }
+  S.marks.forEach((mk, i) => {
+    const m = marksGroup.children[i];
+    m.position.set(mk.wx, mk.z, mk.wy);
+    m.material.color.setHex(mk.color);
+  });
+}
+addEventListener('resize', () => {
+  camera.aspect = view.clientWidth/view.clientHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(view.clientWidth, view.clientHeight);
+});
+// ball dragging
+const ray = new THREE.Raycaster(), mouseV = new THREE.Vector2();
+let dragging = false;
+renderer.domElement.addEventListener('pointerdown', e => {
+  mouseV.set(e.clientX/renderer.domElement.clientWidth*2-1, -(e.clientY/renderer.domElement.clientHeight*2-1));
+  ray.setFromCamera(mouseV, camera);
+  if (ray.intersectObject(ballMesh).length) { dragging = true; controls.enabled = false; }
+});
+renderer.domElement.addEventListener('pointermove', e => {
+  if (!dragging) return;
+  mouseV.set(e.clientX/renderer.domElement.clientWidth*2-1, -(e.clientY/renderer.domElement.clientHeight*2-1));
+  ray.setFromCamera(mouseV, camera);
+  const t = ray.ray.intersectPlane(new THREE.Plane(new THREE.Vector3(0,1,0), -BALL_CZ), new THREE.Vector3());
+  if (t) { ball.x = Math.max(15, Math.min(BED.w-15, t.x)); ball.y = Math.max(12, Math.min(BED.h-12, t.z)); }
+});
+addEventListener('pointerup', () => { dragging = false; controls.enabled = true; });
+// =====================================================================
+//  Main loop: pump the G-code generator, the executor executes, the scene renders
+// =====================================================================
+function resetRun() {
+  M.carr = {A: START.x, B: PARK_B};
+  M.beam = {y: START.y, z: 60};
+  M.active = 'A'; M.cur = null; M.lastProbe = null;
+  M.clicks = 0; M.bad = 0; M.dist = 0; M.ballMoves = 0;
+  S.logbuf = []; S.marks = []; S.pathA = []; S.pathB = [];
+  S.apexA = null; S.apexB = null; S.eoff = null; S.eoffErr = null;
+  document.getElementById('log').innerHTML = '';
+  trailA.geometry = new THREE.BufferGeometry(); trailB.geometry = new THREE.BufferGeometry();
+}
+function startRun(seedPos) {
+  resetRun();
+  if (seedPos) { ball.x = seedPos[0]; ball.y = seedPos[1]; }
+  randToolOffsets();
+  M.noise = document.getElementById('noise').checked;
+  scene.remove(headMeshA); headMeshA = buildHead(false); scene.add(headMeshA);
+  S.running = true; S.status = 'running';
+  S.gen = algoSphere();
+  pump(S.gen.next());
+  updMetrics();
+}
+function pump(res) {
+  if (!S.running) return;
+  if (res.done) { finishRun(); return; }
+  M.loadLine(res.value);
+  if (!M.cur) pump(S.gen.next(M.lastProbe));
+}
+function finishRun() {
+  S.running = false;
+  const e = S.eoffErr;
+  if (e) {
+    S.status = (Math.abs(e.dx)<0.5 && Math.abs(e.dy)<0.5 && Math.abs(e.dz)<0.5 && M.ballMoves === 0) ? '✅ calibrated' : (M.ballMoves > 0 ? '❌ ball moved!' : '❌ offset off');
+    document.getElementById('m_xy').textContent = Math.hypot(e.dx, e.dy).toFixed(2)+' mm';
+    document.getElementById('m_z').textContent = e.dz.toFixed(2)+' mm';
+  } else S.status = 'not found';
+  if (S.eoff) {
+    const trueOff = {dx: nA.x - nB.x, dy: nA.y - nB.y, dz: nA.z - nB.z};
+    document.getElementById('m_off').textContent =
+      `dX=${S.eoff.dx.toFixed(3)}  dY=${S.eoff.dy.toFixed(3)}  dZ=${S.eoff.dz.toFixed(3)}`;
+    document.getElementById('m_true').textContent =
+      `dX=${trueOff.dx.toFixed(3)}  dY=${trueOff.dy.toFixed(3)}  dZ=${trueOff.dz.toFixed(3)}`;
+    if (S.eoffErr) {
+      const er = S.eoffErr;
+      const eOK = Math.abs(er.dx) < 0.5 && Math.abs(er.dy) < 0.5 && Math.abs(er.dz) < 0.5;
+      const el = document.getElementById('m_diff');
+      el.textContent = `dX=${er.dx.toFixed(3)}  dY=${er.dy.toFixed(3)}  dZ=${er.dz.toFixed(3)}`;
+      el.style.color = eOK ? '#7fd47f' : '#ff8f7a';
+    }
+  }
+  updMetrics();
+  log(`=== RESULT: ${S.status} (ball moves ${M.ballMoves}) ===`, S.status.startsWith('✅') ? 'good' : 'bad');
+  if (S.onDone) { const f = S.onDone; S.onDone = null; f(); }
+}
+let lastT = 0;
+function loop(t) {
+  requestAnimationFrame(loop);
+  const dt = Math.min(0.05, (t-lastT)/1000); lastT = t;
+  if (S.running) {
+    // ×N = N-times real time (×1 = the real printer's pace:
+    // travels ~100mm/s, probes 4mm/s). One step per frame, no hidden multipliers
+    const spd = S.fast ? 1e4 : +document.getElementById('speed').value;
+    const steps = S.fast ? 2000 : 1;
+    for (let i = 0; i < steps && S.running; i++) {
+      if (M.step(dt*spd)) pump(S.gen.next(M.lastProbe));
+    }
+    updMetrics();
+  }
+  syncScene();
+  controls.update();
+  renderer.render(scene, camera);
+}
+requestAnimationFrame(loop);
+function updMetrics() {
+  document.getElementById('m_clicks').textContent = M.clicks;
+  document.getElementById('m_bad').textContent = M.bad;
+  document.getElementById('m_mv').textContent = M.ballMoves;
+  document.getElementById('m_dist').textContent = M.dist.toFixed(0);
+  document.getElementById('m_st').textContent = S.status;
+  document.getElementById('m_head').textContent = M.active;
+}
+// =====================================================================
+//  Controls + test harness
+// =====================================================================
+const bindVal = (id, vid, f=v=>v) => { const el = document.getElementById(id), out = document.getElementById(vid);
+  const u = () => out.textContent = f(el.value); el.addEventListener('input', u); u(); };
+bindVal('speed','v_speed');
+for (const id of ['nbx','nby','nbz']) {
+  bindVal(id, 'v_'+id);
+  document.getElementById(id).addEventListener('input', () => {
+    document.getElementById('randB').checked = false; // manual mode: disable random
+    applyNBFromSliders();
+  });
+}
+document.getElementById('run').onclick = () => startRun();
+document.getElementById('reset').onclick = () => { S.running = false; resetRun(); S.status = 'idle'; updMetrics(); };
+function runFastOnce() {
+  // random position in the zone reachable by both carriages
+  ball.x = 110 + rng()*(BED.w-220);
+  ball.y = 40 + rng()*(BED.h-80);
+  startRun(); S.fast = true;
+  let guard = 0;
+  while (S.running && guard++ < 4e6) { if (M.step(0.02*1e4)) pump(S.gen.next(M.lastProbe)); }
+  S.fast = false;
+  const ok = !!(S.eoffErr && Math.abs(S.eoffErr.dx)<0.5 && Math.abs(S.eoffErr.dy)<0.5 && Math.abs(S.eoffErr.dz)<0.5 && S.apexA && S.apexB && M.ballMoves === 0);
+  return {ok, exy: S.eoffErr ? Math.hypot(S.eoffErr.dx, S.eoffErr.dy) : NaN,
+    ez: S.eoffErr ? Math.abs(S.eoffErr.dz) : NaN, clicks: M.clicks, bad: M.bad, dist: M.dist, mv: M.ballMoves};
+}
+document.getElementById('batch').onclick = () => {
+  const N = 15, rs = [];
+  for (let i = 0; i < N; i++) rs.push(runFastOnce());
+  const oks = rs.filter(r=>r.ok);
+  const med = a => a.length ? a.slice().sort((x,y)=>x-y)[Math.floor(a.length/2)] : NaN;
+  const l1 = `Batch ×${N} [sphere${M.noise?'+noise':''}]: ok ${oks.length}/${N}, ball moves ${rs.reduce((s,r)=>s+r.mv,0)}`;
+  const l2 = `median |dXY| ${med(oks.map(r=>r.exy)).toFixed(3)}mm, |dZ| ${med(oks.map(r=>r.ez)).toFixed(3)}mm, clicks ~${Math.round(rs.reduce((s,r)=>s+r.clicks,0)/N)}`;
+  log(l1, oks.length===N?'good':'warn'); log(l2, 'info');
+  document.getElementById('batchout').textContent = l1 + '\n' + l2;
+  document.title = 'SIM3D: ' + l1 + ' ' + l2;
+  updMetrics();
+};
+// ?test=grid[&reps&noise&seed] / ?test=single&bx&by&seed
+const pm = name => { const m = location.search.match(new RegExp('[?&]'+name+'=([^&]+)')); return m ? m[1] : null; };
+if (pm('noise')) document.getElementById('noise').checked = true;
+if (pm('pin') === '0') document.getElementById('pin').checked = false;
+// world parameters from URL (stress tests):
+//   br=<ball radius> pre=<lever pre-travel, Z> jit=<X/Y slop> bump=<ball bump at T1> np=<noise %>
+BALL_R = +(pm('br') || 5);
+BALL_CZ = 39.5 + BALL_R;
+M.pre = +(pm('pre') || 0); M.jit = +(pm('jit') || 0);
+M.bump = +(pm('bump') || 0);
+if (pm('bt') !== null) RUN_CFG.ballTop = +pm('bt'); // optional ball top height (speed-up)
+if (pm('np')) M.noisePct = +pm('np');
+if (BALL_R !== 5) { ballMesh.geometry.dispose(); ballMesh.geometry = new THREE.SphereGeometry(BALL_R, 32, 24); }
+// manual B offset from URL: &randB=0&nbx=8&nby=1&nbz=-0.2
+if (pm('randB') === '0') document.getElementById('randB').checked = false;
+for (const [p, id] of [['nbx','nbx'],['nby','nby'],['nbz','nbz']]) {
+  const v = pm(p);
+  if (v !== null) document.getElementById(id).value = v;
+}
+const seedm = pm('seed');
+if (seedm !== null) rng = mulberry32(+seedm || 1);
+if (location.search.includes('test=grid') || location.search.includes('test=single')) {
+  // grid over the zone reachable by both carriage nozzles
+  const xs = [110, 155, 200, 245, 290], ys = [50, 100, 150, 200];
+  const holes = [[132,75],[177,125],[222,175]];
+  const poses = [];
+  for (const gx of xs) for (const gy of ys) poses.push([gx, gy]);
+  for (const h of holes) poses.push(h);
+  const master = +(pm('seed') || 1);
+  const poseSeed = p => master*7919 + p[0]*131 + p[1]*17;
+  setTimeout(() => {
+    try {
+      const runOne = () => {
+        startRun(); S.fast = true;
+        let guard = 0;
+        while (S.running && guard++ < 4e6) { if (M.step(0.02*1e4)) pump(S.gen.next(M.lastProbe)); }
+        S.fast = false; S.running = false;
+      };
+      if (location.search.includes('test=single')) {
+        ball.x = +(pm('bx') || 200); ball.y = +(pm('by') || 130);
+        rng = mulberry32(poseSeed([ball.x, ball.y]));
+        runOne();
+        log(`done: clicks=${M.clicks} bad=${M.bad} moves=${M.ballMoves} dist=${Math.round(M.dist)}mm`, 'info');
+        document.title = `SINGLE3D: clicks=${M.clicks} bad=${M.bad} mv=${M.ballMoves} eoff=${S.eoffErr?S.eoffErr.dx.toFixed(3)+'/'+S.eoffErr.dy.toFixed(3)+'/'+S.eoffErr.dz.toFixed(3):'-'}`;
+        return;
+      }
+      const reps = +(pm('reps') || 1);
+      const rows = [], all = [];
+      for (let rep = 0; rep < reps; rep++)
+        for (const p of poses) {
+          rng = mulberry32(poseSeed(p) + rep*104729);
+          ball.x = p[0]; ball.y = p[1];
+          runOne();
+          const r = {pos:`(${p[0]},${p[1]})`, ok: !!(S.eoffErr && Math.abs(S.eoffErr.dx)<0.5 && Math.abs(S.eoffErr.dy)<0.5 && Math.abs(S.eoffErr.dz)<0.5 && M.ballMoves === 0),
+            exy: S.eoffErr ? Math.hypot(S.eoffErr.dx, S.eoffErr.dy) : NaN,
+            ez: S.eoffErr ? Math.abs(S.eoffErr.dz) : NaN,
+            clicks: M.clicks, bad: M.bad, dist: M.dist, mv: M.ballMoves};
+          all.push(r);
+          rows.push(`${r.ok?'✓':'✗'} ${r.pos} XY${isNaN(r.exy)?'-':r.exy.toFixed(3)} Z${isNaN(r.ez)?'-':r.ez.toFixed(3)} cl${r.clicks} bad${r.bad} mv${r.mv} path${Math.round(r.dist)}mm`);
+          if (!r.ok) rows.push('--- failure log ---\n' + S.logbuf.join('\n'));
+          else S.logbuf = [];
+        }
+      const oks = all.filter(r=>r.ok);
+      const med = a => a.length ? a.slice().sort((x,y)=>x-y)[Math.floor(a.length/2)] : NaN;
+      const sum = `GRID3D [sphere${M.noise?'+noise':''}]: ${oks.length}/${all.length} ok | medXY ${med(oks.map(r=>r.exy)).toFixed(3)} medZ ${med(oks.map(r=>r.ez)).toFixed(3)} | cl med${Math.round(med(all.map(r=>r.clicks)))} | moves ${all.reduce((s,r)=>s+r.mv,0)} | path med${Math.round(med(all.map(r=>r.dist)))}mm`;
+      log(sum, oks.length===all.length?'good':'bad');
+      document.getElementById('batchout').textContent = sum + '\n' + rows.join('\n');
+      document.title = 'GRID3D: ' + sum;
+    } catch (e) { console.error(e); document.title = 'GRID3D ERROR: ' + e.message; }
+  }, 600);
+}
+applyNBFromSliders();
+syncScene();
+</script>
+</body>
+</html>
