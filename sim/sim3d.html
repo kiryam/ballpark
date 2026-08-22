@@ -131,8 +131,24 @@ function randToolOffsets() {
 }
 let rng = Math.random;
 function mulberry32(a) { return function() { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+// HEADS: 'vostok' (real Bereza geometry measured from the Fusion model) or 'sb'
+const HEADS = new URLSearchParams(location.search).get('heads') || 'vostok';
 function els(headB) {
   const d = headB ? geo.bl : 0;
+  if (HEADS === 'vostok') {
+    // measured from the Fusion vostok_v9.4 assembly (Bereza printhead,
+    // Goliath Air hotend). The nozzle is the lowest point (as on any
+    // printable toolhead); the part-cooling ducts are narrow tubes BESIDE
+    // and BEHIND it (dx -17 and -27), a little higher - side traps like
+    // the StealthBurner ducts, so the proven escape logic applies.
+    return [
+      {name:'nozzle', dx:0, dy:0, r:0.4, zo:0},
+      {name:'sock', dx:0, dy:0, r:6, zo:1.5 + d},
+      {name:'block', dx:0, dy:0, r:11, zo:4.5 + d},
+      {name:'duct tube 1', dx:-17, dy:2, r:4.5, zo:1.2 + d},
+      {name:'duct tube 2', dx:-27, dy:2, r:4, zo:1.8 + d},
+    ];
+  }
   const e = [
     {name:'nozzle', dx:0, dy:0, r:0.4, zo:0},
     {name:'sock', dx:0, dy:0, r:geo.rs, zo:geo.zs + d},
@@ -411,14 +427,17 @@ function* travel(x, y, z = 60) { yield `G0 Z${z.toFixed(1)}`; yield `G0 X${x.toF
 // and prints the discovered config value. Ball XY is deliberately never saved.
 const RUN_CFG = {ballTop: null};
 function* press(x, y) {
-  const sz = RUN_CFG.ballTop !== null ? RUN_CFG.ballTop + 2.5 : 56;
+  // travel height must clear not just the nozzle but the LOWEST element:
+  // vostok duct tubes hang ~2.8mm below the nozzle tip
+  const dip = 2.5;
+  const sz = RUN_CFG.ballTop !== null ? RUN_CFG.ballTop + dip : 56;
   yield* travel(x, y, sz);
   return yield `G38.2 Z39 F240`;
 }
 function* algoSphere() {
   const clx = x => Math.max(60, Math.min(BED.w-60, x));
   const cly = y => Math.max(15, Math.min(BED.h-15, y));
-  let head = 'A', stage = 0; // 0=A(scan) 1=B 2=revision A
+  let head = 'A', stage = 0, climbClicks = 0; // 0=A(scan) 1=B 2=revision A
   S._samples = {A: [], B: []};
   let best = {x: START.x, y: START.y, z: -1, el: null};
   const updBest = r => { if (r && r.triggered && r.el !== 'glitch' && r.z > best.z) best = {x: r.x, y: r.y, z: r.z, el: r.el}; };
@@ -479,10 +498,13 @@ function* algoSphere() {
     yield `M117 hill climb`;
     let cur = best, d = 4, vretry = 0, fittry = 0, fit = null;
     const samples = () => S._samples[head];
+    climbClicks = 0;
     climb: while (true) {
+      if (climbClicks > 450) { log("climb budget exceeded - settling on best click", 0); break climb; }
       const probes = [];
       for (const [dx, dy] of [[1,0],[-1,0],[0,1],[0,-1]]) {
         const r = yield* press(clx(cur.x+dx*d), cly(cur.y+dy*d));
+        climbClicks++;
         if (r && r.triggered && r.el !== 'glitch') { samples().push({x:r.x, y:r.y, z:r.z, el:r.el}); probes.push(r); updBest(r); }
       }
       let up = null;
@@ -493,10 +515,18 @@ function* algoSphere() {
       if (eq && top && top.el === 'nozzle') break climb;
       if (!eq && d > 0.7) { d /= 2; continue; }
       let escaped = null;
-      for (const rr of [5, 9, 14, 20]) {
-        for (let k = 0; k < 8 && !escaped; k++) {
-          const a = k/8*2*Math.PI;
+      // vostok: the nozzle wins over the duct only within ~2.2mm of the ball
+      // center, so escape rings must be dense to guarantee a hit
+      const ESC_RADII = HEADS === 'vostok'
+        ? [4, 6, 8, 10, 12, 14, 16, 18, 20] : [5, 9, 14, 20];
+      for (const rr of ESC_RADII) {
+        // vostok: the nozzle-win zone is only ~2.2mm wide, so 8 angular
+        // samples can straddle it - use 16
+        const NPT = HEADS === 'vostok' ? 16 : 8;
+        for (let k = 0; k < NPT && !escaped; k++) {
+          const a = k/NPT*2*Math.PI;
           const r = yield* press(clx(cur.x+rr*Math.cos(a)), cly(cur.y+rr*Math.sin(a)));
+          climbClicks++;
           if (r && r.triggered && r.el !== 'glitch') {
             samples().push({x:r.x, y:r.y, z:r.z, el:r.el}); updBest(r);
             // early exit: a nozzle point is always on the sphere; clearly higher is an escape too
@@ -505,19 +535,20 @@ function* algoSphere() {
         }
       }
       if (escaped) { cur = escaped; d = 4; continue climb; }
-      const offs2 = [];
-      for (const e of els(head === 'B')) {
-        if (e.dx === 0 && e.dy === 0) continue;
-        if (!offs2.some(o2 => o2[0] === e.dx && o2[1] === e.dy)) offs2.push([e.dx, e.dy]);
-      }
+      // jumps along element offsets (known head geometry); a hard budget
+      // terminates any plateau wander (the vostok duct plateau is huge)
+      const offs2 = els(head === 'B').filter(e => e.dx !== 0 || e.dy !== 0)
+          .map(e => [e.dx, e.dy]);
       let jumped = null;
       for (const [dx, dy] of offs2) {
         const r = yield* press(clx(cur.x+dx), cly(cur.y+dy));
+        climbClicks++;
         if (r && r.triggered && r.el !== 'glitch') { samples().push({x:r.x, y:r.y, z:r.z, el:r.el}); updBest(r);
           if (r.el === 'nozzle' || r.z > cur.z - 1.0) jumped = r; }
-        if (jumped) break; // early exit: the jump worked
+        if (jumped) break;
       }
-      if (jumped) { cur = jumped; d = 2; continue climb; }
+      if (jumped && climbClicks < 450) { cur = jumped; d = 2; continue climb; }
+      if (climbClicks >= 450) log("climb budget exceeded - settling on best click", 0);
       break climb;
     }
     // --- phase 3: sphere + verification ---
@@ -637,6 +668,12 @@ bedMesh.position.set(BED.w/2, 39.5 - 1.5, BED.h/2); scene.add(bedMesh);
 const grid = new THREE.GridHelper(Math.max(BED.w, BED.h), Math.max(BED.w, BED.h)/10, 0x3a4356, 0x272e3c);
 grid.position.set(BED.w/2, 39.55, BED.h/2); scene.add(grid);
 // X gantry rail (visual): the carriages ride it
+const vRailMesh = new THREE.Mesh(new THREE.BoxGeometry(BED.w, 9, 9),
+  new THREE.MeshStandardMaterial({color: 0x8a8f9a, metalness: .7, roughness: .35}));
+scene.add(vRailMesh); vRailMesh.visible = false;
+const railMesh = new THREE.Mesh(new THREE.BoxGeometry(1,1,1),
+  new THREE.MeshStandardMaterial({color: 0x77828f, metalness: .5, roughness: .4}));
+scene.add(railMesh); railMesh.visible = false;
 const rail = new THREE.Mesh(new THREE.BoxGeometry(BED.w + 60, 8, 8),
   new THREE.MeshStandardMaterial({color: 0x556077, metalness: .6, roughness: .3}));
 scene.add(rail);
@@ -655,6 +692,71 @@ const ballMesh = new THREE.Mesh(new THREE.SphereGeometry(BALL_R, 32, 24),
 scene.add(ballMesh);
 // StealthBurner shell (STL) - shared by both heads, tinted differently
 let sbGeometry = null;
+// ---- vostok: real Bereza toolheads + X beam from the Fusion v9.4 model ----
+// Positions measured in the assembly (mm, relative to the nozzle tip):
+//   three.x = fx - fNozzle.x, three.y = fy - fNozzle.y (up), three.z = -(fz - fNozzle.z)
+// each STL is centered on its own bbox in JS, so only the delta matters.
+const VOSTOK_PARTS = {
+  L: [ // nozzle (Fusion world): (45.0, -6.22, -9.35) cm
+    ['vL_body.stl',    0,    6.7, -73.5],   // Bereza body, Goliath 4010 variant
+    ['vL_hotend.stl',  0,   18.6, -37.4],
+    ['vL_cool.stl',  -11.1, 11.1, -92.3],
+    ['vL_mf.stl',      0,   28.2, -111.0],
+    ['vL_carr.stl',   -5.5, 50.7, -110.0],
+    ['vL_fan.stl',     0,  -17.3, -73.5],
+    ['vL_spacer.stl',  0,   67.7, -71.5],
+  ],
+  R: [ // nozzle: (50.5, -6.22, -9.35) cm
+    ['vR_body.stl',    0,    6.7, -73.5],   // Bereza body, Goliath 4010 variant
+    ['vR_hotend.stl',  0,   18.6, -37.4],
+    ['vR_cool.stl',   10.5, 11.1, -92.5],
+    ['vR_mf.stl',      0,   28.2, -111.0],
+    ['vR_carr.stl',    5.5, 50.7, -110.0],
+    ['vR_fan.stl',     0,  -17.3, -73.5],
+    ['vL_spacer.stl',  0,   67.7, -71.5],   // spacer is shared L/R
+  ],
+};
+const VOSTOK_TUBE = {file: 'vostok_x_tube.stl', len: 500, dz: -71.5, dy: 51.7}; // vs nozzle
+const VBUST = Date.now() % 1000000;
+let vostokGeoms = null;
+try {
+  const cache = {};
+  function parseBinarySTL(ab) {
+    // minimal binary-STL reader (three's STLLoader trips on Fusion headers)
+    const dv = new DataView(ab);
+    const n = dv.getUint32(80, true);
+    if (84 + n*50 !== ab.byteLength) throw new Error('not a binary STL');
+    const pos = new Float32Array(n*9), nor = new Float32Array(n*9);
+    for (let i = 0; i < n; i++) {
+      const o = 84 + i*50;
+      const nx = dv.getFloat32(o, true), ny = dv.getFloat32(o+4, true), nz = dv.getFloat32(o+8, true);
+      for (let v = 0; v < 3; v++) {
+        const p = o + 12 + v*12, w = i*9 + v*3;
+        pos[w] = dv.getFloat32(p, true); pos[w+1] = dv.getFloat32(p+4, true); pos[w+2] = dv.getFloat32(p+8, true);
+        nor[w] = nx; nor[w+1] = ny; nor[w+2] = nz;
+      }
+    }
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    g.setAttribute('normal', new THREE.BufferAttribute(nor, 3));
+    return g;
+  }
+  async function loadV(file) {
+    if (!cache[file]) {
+      const g = parseBinarySTL(await (await fetch('./' + file + '?b=' + VBUST)).arrayBuffer());
+      g.computeBoundingBox();
+      const b = g.boundingBox;
+      g.translate(-(b.min.x+b.max.x)/2, -(b.min.y+b.max.y)/2, -(b.min.z+b.max.z)/2);
+      cache[file] = g;
+    }
+    return cache[file];
+  }
+  vostokGeoms = {L: [], R: [], tube: await loadV(VOSTOK_TUBE.file)};
+  for (const k of ['L', 'R'])
+    for (const [f, x, y, z] of VOSTOK_PARTS[k])
+      vostokGeoms[k].push({g: await loadV(f), x, y, z});
+  log('vostok STL loaded: real Bereza toolheads + X beam (from Fusion v9.4)', 'info');
+} catch (e) { log('vostok STL failed: ' + e.message, 'warn'); vostokGeoms = null; }
 try {
   sbGeometry = new STLLoader().parse(await (await fetch('./stealthburner_body.stl')).arrayBuffer());
   sbGeometry.computeBoundingBox();
@@ -740,6 +842,20 @@ function buildHead(isB) {
   const g = new THREE.Group();
   const mat = c => new THREE.MeshStandardMaterial({color: c, roughness: .55, metalness: .25});
   const d = isB ? geo.bl : 0;
+  if (HEADS === 'vostok' && vostokGeoms) {
+    // real Bereza toolhead from the Fusion model; physics lives in els()
+    const tint = isB ? 0x9fc0e8 : 0xd8dde6;
+    for (const part of vostokGeoms[isB ? 'R' : 'L']) {
+      const m = new THREE.Mesh(part.g, mat(tint));
+      m.position.set(part.x, part.y + d, part.z);
+      g.add(m);
+    }
+    // tiny nozzle cone at the origin (the STLs are body-level detail)
+    const nz = new THREE.Mesh(new THREE.ConeGeometry(1.2, 4, 12), mat(0xc8a8d0));
+    nz.rotation.x = Math.PI; nz.position.y = 2; g.add(nz);
+    g.userData.fans = [];
+    return g;
+  }
   // --- hotend: nozzle cone, heater block with cartridge, heatsink ---
   const nozzle = new THREE.Mesh(new THREE.ConeGeometry(1.4, 4, 16), mat(0xc8a8d0));
   nozzle.rotation.x = Math.PI; nozzle.position.y = 2; g.add(nozzle);
@@ -829,7 +945,20 @@ function syncScene() {
   headMeshB.traverse(o => { if (o.isMesh) { o.material.transparent = M.active === 'B'; o.material.opacity = M.active === 'B' ? 1 : 0.4; } });
   headMeshA.traverse(o => { if (o.isMesh) { o.material.transparent = M.active === 'A'; o.material.opacity = M.active === 'A' ? 1 : 0.4; } });
   // the X rail sits BEHIND the heads: they hang on its front face
-  rail.position.set(BED.w/2, M.beam.z + 85, M.beam.y - 22);
+  if (HEADS === 'vostok' && vostokGeoms) {
+    // real 20x20x500 tube + MGN9 rail from the model; tube STL is centered,
+    // dy/dz measured from the nozzle in the assembly
+    if (!railMesh.userData.up) { railMesh.geometry = vostokGeoms.tube; railMesh.userData.up = true; }
+    railMesh.position.set(BED.w/2, M.beam.z + VOSTOK_TUBE.dy, M.beam.y - VOSTOK_TUBE.dz);
+    railMesh.visible = true;
+    vRailMesh.position.set(BED.w/2, M.beam.z + VOSTOK_TUBE.dy - 13, M.beam.y - VOSTOK_TUBE.dz);
+    vRailMesh.visible = true;
+  } else {
+    rail.visible = true;
+    railMesh.visible = false;
+    vRailMesh.visible = false;
+  }
+  if (HEADS === 'vostok' && vostokGeoms) rail.visible = false;
   parkAMesh.position.set(PARK_A, 100, M.beam.y - 45);
   parkBMesh.position.set(PARK_B, 100, M.beam.y - 45);
   const push = (arr, line, x, y, z) => {
