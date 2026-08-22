@@ -387,7 +387,7 @@ function gmon(line, cur) {
   el.innerHTML = ((el._lines || []).concat(el._cur ? ['<b style="color:#ffd479">' + el._cur + '</b>'] : [])).join('\n');
   el.scrollTop = el.scrollHeight;
 }
-function mark(wx, wy, z, color) { S.marks.push({wx, wy, z, color}); }
+function mark(wx, wy, z, color) { S.marks.push({wx, wy, z, color, t: S.hist.length}); }
 // LSQ sphere fit + RANSAC
 function fitSphere(pts) {
   const n = pts.length;
@@ -1009,7 +1009,12 @@ function syncScene() {
   while (marksGroup.children.length < S.marks.length) {
     marksGroup.add(new THREE.Mesh(new THREE.SphereGeometry(0.9, 8, 6), new THREE.MeshBasicMaterial()));
   }
-  marksGroup.children.forEach((m, i) => { m.visible = i < S.marks.length; });
+  // markers: pooled visibility + replay scrub (a dot shows only after its
+  // history index has been reached by the slider)
+  const lim = (S.replayPos === null || S.replayPos === undefined) ? Infinity : S.replayPos;
+  marksGroup.children.forEach((m, i) => {
+    m.visible = i < S.marks.length && S.marks[i].t <= lim;
+  });
   S.marks.forEach((mk, i) => {
     const m = marksGroup.children[i];
     m.position.set(mk.wx, mk.z, mk.wy);
@@ -1035,9 +1040,12 @@ replayEl.addEventListener('input', () => {
   const h = S.hist[+replayEl.value];
   if (!h) return;
   M.carr.A = h.a; M.carr.B = h.b; M.beam.z = h.bz; M.beam.y = h.by;
+  S.replayPos = +replayEl.value;
 });
 document.getElementById('replayClose').onclick = () => {
   replayBar.style.display = 'none';
+  S.replayPos = null;
+  marksGroup.children.forEach(m => m.visible = true);
   const h = S.hist[S.hist.length - 1];
   if (h) { M.carr.A = h.a; M.carr.B = h.b; M.beam.z = h.bz; M.beam.y = h.by; }
 };
@@ -1067,7 +1075,7 @@ function resetRun() {
   M.clicks = 0; M.bad = 0; M.dist = 0; M.ballMoves = 0;
   S.logbuf = []; S.marks = []; S.pathA = []; S.pathB = [];
   S.apexA = null; S.apexB = null; S.eoff = null; S.eoffErr = null; S.foreignApex = false;
-  S.hist = []; if (typeof updateReplaySlider === 'function') updateReplaySlider();
+  S.hist = []; S.replayPos = null; if (typeof updateReplaySlider === 'function') updateReplaySlider();
   document.getElementById('log').innerHTML = '';
   trailA.geometry = new THREE.BufferGeometry(); trailB.geometry = new THREE.BufferGeometry();
 }
