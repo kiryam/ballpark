@@ -154,6 +154,9 @@ function els(headB) {
       {name:'duct tube 1', dx:-17, dy:2, r:4.5, zo:1.2 + d},
       {name:'duct tube 2', dx:-27, dy:2, r:4, zo:1.8 + d},
     ];
+    // BLTouch: during calibration its pin is RETRACTED, so the nozzle stays
+    // the lowest point; only the body matters - beside the nozzle, above the tip
+    e0.push({name:'bltouch body', dx:-24, dy:-6, r:3, zo:9 + d});
     const pin = document.getElementById('pin');
     if (!headB && pin && pin.checked)
       e0.push({name:'pin', dx:-6, dy:4, r:0.6, zo: PIN_ZP + d});
@@ -218,15 +221,21 @@ const M = {
     return best;
   },
   minGap() {
-    const w = this.world(), isB = this.active === 'B';
+    // check BOTH heads: the active one (probing/collision) and the parked
+    // one - its elements can physically knock the ball just as well.
+    // The parked head's world position = its carriage + its own nozzle offset.
     let g = Infinity, el = null, ex = 0, ey = 0;
-    for (const e of els(isB)) {
-      const ecx = w.x + e.dx, ecy = w.y + e.dy;
-      const dxy = Math.hypot(ecx - ball.x, ecy - ball.y);
-      const horiz = Math.max(dxy - e.r, 0);
-      const vert = (w.z + e.zo) - BALL_CZ;
-      const d = Math.hypot(horiz, vert);
-      if (d < g) { g = d; el = e.name; ex = ecx; ey = ecy; }
+    for (const hd of ['A', 'B']) {
+      const n = hd === 'B' ? nB : nA;
+      const wx = this.carr[hd] + n.x, wy = this.beam.y + n.y, wz = this.beam.z + n.z;
+      for (const e of els(hd === 'B')) {
+        const ecx = wx + e.dx, ecy = wy + e.dy;
+        const dxy = Math.hypot(ecx - ball.x, ecy - ball.y);
+        const horiz = Math.max(dxy - e.r, 0);
+        const vert = (wz + e.zo) - BALL_CZ;
+        const d = Math.hypot(horiz, vert);
+        if (d < g) { g = d; el = e.name + (hd === this.active ? '' : ' [' + hd + ' parked]'); ex = ecx; ey = ecy; }
+      }
     }
     return {gap: g - BALL_R, el, ex, ey};
   },
@@ -1029,6 +1038,30 @@ addEventListener('resize', () => {
 // ---- replay slider: scrub the recorded motion history ----
 const replayBar = document.getElementById('replaybar');
 const replayEl = document.getElementById('replay');
+function auditCollisions() {
+  // scan the recorded history: any frame where EITHER head's element is
+  // within 0.5mm of the ball surface (visual overlap the user can spot)
+  if (!S.hist.length) return;
+  let worst = null;
+  for (let t = 0; t < S.hist.length; t++) {
+    const h = S.hist[t];
+    for (const hd of ['A', 'B']) {
+      const n = hd === 'B' ? nB : nA;
+      const wx = (hd === 'A' ? h.a : h.b) + n.x, wy = h.by + n.y, wz = h.bz + n.z;
+      for (const e of els(hd === 'B')) {
+        const ecx = wx + e.dx, ecy = wy + e.dy;
+        const dxy = Math.hypot(ecx - ball.x, ecy - ball.y);
+        const horiz = Math.max(dxy - e.r, 0);
+        const vert = (wz + e.zo) - BALL_CZ;
+        const gap = Math.hypot(horiz, vert) - BALL_R;
+        if (worst === null || gap < worst.gap)
+          worst = {gap, t, hd, el: e.name, x: ecx, y: ecy, z: wz + e.zo};
+      }
+    }
+  }
+  log(`collision audit: worst gap ${worst.gap.toFixed(2)}mm` +
+      (worst.gap < 0.5 ? ` !! ${worst.el} [${worst.hd}] at t=${worst.t} (${worst.x.toFixed(0)},${worst.y.toFixed(0)},${worst.z.toFixed(1)})` : ' - clear'), worst.gap < 0.5 ? 'bad' : 'good');
+}
 function updateReplaySlider() {
   if (typeof replayEl === 'undefined' || !replayEl) return;
   replayEl.max = Math.max(0, S.hist.length - 1);
@@ -1121,6 +1154,7 @@ function finishRun() {
     }
   }
   updateReplaySlider();
+  if (location.search.includes('checkcoll')) auditCollisions();
   updMetrics();
   log(`=== RESULT: ${S.status} (ball moves ${M.ballMoves}) ===`, S.status.startsWith('✅') ? 'good' : 'bad');
   if (S.onDone) { const f = S.onDone; S.onDone = null; f(); }
