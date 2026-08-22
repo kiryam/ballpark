@@ -39,7 +39,7 @@
 </div>
 <div id="hud">IDEX: two carriages on one X gantry · inactive one parks · lateral touch by a non-nozzle element = ball moved<br>
   dots: green=nozzle · orange=PIN · violet=bltouch · red=other · LMB orbit · wheel zoom<br>
-  <b id="hudver"></b></div>
+  <b id="hudver"></b> · <span id="renddbg"></span></div>
 </div>
 <div class="right">
   <div class="panel">
@@ -136,6 +136,11 @@ function randToolOffsets() {
   } else applyNBFromSliders();
 }
 let rng = Math.random;
+// crash visibility: a dead module looks like "nothing renders"; surface it
+addEventListener('error', e => { document.title = 'PAGEERR: ' + (e.message || 'unknown'); });
+// rAF-vs-timer watchdog: if ticks climb but __frames does not, the renderer
+// is hidden/throttled or the loop threw after the first frame
+window.__ticks = 0; setInterval(() => window.__ticks++, 100);
 function mulberry32(a) { return function() { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
 // HEADS: 'vostok' (real Bereza geometry measured from the Fusion model) or 'sb'
 const HEADS = new URLSearchParams(location.search).get('heads') || 'vostok';
@@ -399,7 +404,7 @@ function gmon(line, cur) {
   el.scrollTop = el.scrollHeight;
 }
 function markColor(el) {
-  if (el === 'nozzle') return 0x3fd35f;                    // green: nozzle only
+  if (el === 'nozzle') return 0x00ff00;                    // green: nozzle only
   if (el === 'pin') return 0xff9500;                       // orange: decoy pin
   if (el && el.indexOf('bltouch') === 0) return 0xb06cff;  // violet
   return 0xff5a3d;                                         // red: sock/block/duct
@@ -696,10 +701,17 @@ const camera = new THREE.PerspectiveCamera(45, view.clientWidth/view.clientHeigh
 camera.position.set(320, 420, 520);
 const controls = new OrbitControls(camera, renderer.domElement);
 // ?cam=close - start near the ball (mark-verification view)
-if (new URLSearchParams(location.search).get('cam') === 'close') {
-  camera.position.set(ball.x + 60, ball.z + 55, ball.y + 90);
-  controls.target.set(ball.x, ball.z, ball.y);
+const CAM_CLOSE = new URLSearchParams(location.search).get('cam') === 'close';
+if (CAM_CLOSE) {
+  // scene coords are (x, z-up, y) - see ballMesh.position.set(ball.x, BALL_CZ, ball.y).
+  // Chase cam: the harness moves the ball between poses, so re-aim every frame.
+  camera.position.set(ball.x + 60, BALL_CZ + 55, ball.y + 90);
+  controls.target.set(ball.x, BALL_CZ, ball.y);
 }
+// IAB guests lose the WebGL context on suspend/restore - revive instead of
+// rendering to a dead context forever (three re-uploads on restore)
+renderer.domElement.addEventListener('webglcontextlost', e => { e.preventDefault(); }, false);
+renderer.domElement.addEventListener('webglcontextrestored', () => { renderer.render(scene, camera); }, false);
 controls.target.set(BED.w/2, 45, BED.h/2);
 controls.enableDamping = true;
 scene.add(new THREE.AmbientLight(0xffffff, 0.6));
@@ -764,7 +776,7 @@ const VOSTOK_PARTS = {
   ],
 };
 const VOSTOK_TUBE = {file: 'vostok_x_tube.stl', len: 500, dy: 71.5, dz: -51.7}; // vs nozzle (y up, z front)
-const SIM_VER = 'v79';
+const SIM_VER = 'v80';
 const VBUST = Date.now() % 1000000;
 document.getElementById('hudver').textContent = SIM_VER + ' (green dot = a click the physics engine attributed to the NOZZLE disc at the head origin; if the mesh visibly disagrees, the STL placement is wrong - report it)';
 let vostokGeoms = null;
@@ -1039,7 +1051,7 @@ function syncScene() {
   push(S.pathA, trailA, a.x, a.z, a.y);
   push(S.pathB, trailB, b.x, b.z, b.y);
   while (marksGroup.children.length < S.marks.length) {
-    marksGroup.add(new THREE.Mesh(new THREE.SphereGeometry(0.9, 8, 6), new THREE.MeshBasicMaterial()));
+    marksGroup.add(new THREE.Mesh(new THREE.SphereGeometry(1.8, 10, 8), new THREE.MeshBasicMaterial({toneMapped: false})));
   }
   // markers: pooled visibility + replay scrub (a dot shows only after its
   // history index has been reached by the slider)
@@ -1049,7 +1061,17 @@ function syncScene() {
   });
   S.marks.forEach((mk, i) => {
     const m = marksGroup.children[i];
-    m.position.set(mk.wx, mk.z, mk.wy);
+    // lateral-click marks carry a z that does not sit on the sphere surface
+    // at their XY - project every dot radially onto the ball so none end up
+    // INSIDE the opaque sphere (invisible). Dots further out are untouched.
+    let dx = mk.wx - ball.x, dy = mk.z - BALL_CZ, dz = mk.wy - ball.y;
+    const d = Math.hypot(dx, dy, dz);
+    const rTarget = BALL_R + 1.2;
+    if (d > 1e-6 && d < rTarget) {
+      const k = rTarget / d;
+      dx *= k; dy *= k; dz *= k;
+    }
+    m.position.set(ball.x + dx, BALL_CZ + dy, ball.y + dz);
     m.material.color.setHex(mk.color);
   });
 }
@@ -1184,23 +1206,96 @@ function finishRun() {
 }
 let lastT = 0;
 function loop(t) {
-  requestAnimationFrame(loop);
   const dt = Math.min(0.05, (t-lastT)/1000); lastT = t;
+  window.__lastFrame = performance.now();
   if (S.running) {
     // ×N = N-times real time (×1 = the real printer's pace:
     // travels ~100mm/s, probes 4mm/s). One step per frame, no hidden multipliers
     const spd = S.fast ? 1e4 : +document.getElementById('speed').value;
     const steps = S.fast ? 2000 : 1;
-    for (let i = 0; i < steps && S.running; i++) {
-      if (M.step(dt*spd)) pump(S.gen.next(M.lastProbe));
+    try {
+      for (let i = 0; i < steps && S.running; i++) {
+        if (M.step(dt*spd)) pump(S.gen.next(M.lastProbe));
+      }
+    } catch (err) {
+      const dbg = document.getElementById('renddbg');
+      if (dbg && !dbg.textContent.includes('ERR')) dbg.textContent += ' · STEP-ERR ' + (err && err.message);
     }
     updMetrics();
   }
-  syncScene();
-  controls.update();
-  renderer.render(scene, camera);
+  if (CAM_CLOSE) {
+    // keep the close-up framed on the ball even after test-pose moves
+    controls.target.set(ball.x, BALL_CZ, ball.y);
+    camera.position.set(ball.x + 60, BALL_CZ + 55, ball.y + 90);
+  }
+  try {
+    syncScene();
+    controls.update();
+    renderer.render(scene, camera);
+    window.__frames = (window.__frames || 0) + 1;
+    if (PXDBG && window.__frames % 10 === 0) canvasProbe();
+  } catch (err) {
+    const dbg = document.getElementById('renddbg');
+    if (dbg && !dbg.textContent.includes('ERR')) dbg.textContent += ' · ERR ' + (err && err.message);
+  }
 }
-requestAnimationFrame(loop);
+// self-report: read back a canvas patch centered on the ball and count
+// color families - proves what actually got rasterized, no screenshots
+const PXDBG = new URLSearchParams(location.search).get('debug') === 'px';
+function canvasProbe() {
+  try {
+    const gl = renderer.getContext();
+    const dw = renderer.domElement.width, dh = renderer.domElement.height;
+    const buf = new Uint8Array(4*dw*dh);
+    gl.readPixels(0, 0, dw, dh, gl.RGBA, gl.UNSIGNED_BYTE, buf);
+    const fam = {green: 0, orange: 0, red: 0, violet: 0};
+    const box = {green: null, orange: null, red: null, violet: null};
+    const addBox = (k, x, y) => {
+      const b = box[k] || (box[k] = {x0: x, x1: x, y0: y, y1: y});
+      if (x < b.x0) b.x0 = x; if (x > b.x1) b.x1 = x;
+      if (y < b.y0) b.y0 = y; if (y > b.y1) b.y1 = y;
+    };
+    for (let y = 0; y < dh; y += 2) for (let x = 0; x < dw; x += 2) {
+      const i = 4*(y*dw + x);
+      const r = buf[i], g = buf[i+1], b = buf[i+2];
+      // dot families: fairly saturated, g-dominant / warm / violet
+      let k = null;
+      if (g > 130 && g > r+50 && g > b+50) k = 'green';
+      else if (r > 200 && g >= 60 && g <= 200 && b < 100 && (r-g) > 40) k = (g > 130 ? 'orange' : 'red');
+      else if (b > 180 && r > 120 && g < 150) k = 'violet';
+      if (k) { fam[k]++; addBox(k, x, y); }
+    }
+    const o = {green: fam.green, orange: fam.orange, red: fam.red, violet: fam.violet};
+    for (const k in o) if (box[k]) o[k] = `${fam[k]}@[${box[k].x0}-${box[k].x1},${box[k].y0}-${box[k].y1}]`;
+    window.__probe = o;
+  } catch (e) { window.__probe = {err: ''+e}; }
+}
+// rAF chain with stall fallback: embedded/hidden guests throttle rAF to 0
+// while the compositor stays live (DOM updates keep showing) - drive the
+// same loop from a timer so the canvas never freezes to black
+let rafOn = false;
+function scheduleLoop() {
+  if (rafOn) return; rafOn = true;
+  requestAnimationFrame(t => { rafOn = false; loop(t); scheduleLoop(); });
+}
+scheduleLoop();
+setInterval(() => {
+  const dbg = document.getElementById('renddbg');
+  if (dbg) {
+    const mc = {g: 0, o: 0, r: 0, v: 0};
+    for (const m of S.marks) {
+      if (m.color === 0x00ff00) mc.g++;         // nozzle
+      else if (m.color === 0xff9500) mc.o++;   // pin
+      else if (m.color === 0xb06cff) mc.v++;   // bltouch
+      else if (m.color === 0xff5a3d) mc.r++;   // sock/block/duct
+    }
+    const p = window.__probe || {};
+    let vis = 0, pooled = marksGroup ? marksGroup.children.length : -1;
+    if (marksGroup) for (const c of marksGroup.children) if (c.visible) vis++;
+    dbg.textContent = `${document.visibilityState} · frames ${window.__frames||0} · marks g${mc.g} o${mc.o} r${mc.r} v${mc.v} · vis ${vis}${PXDBG ? ' · px ' + JSON.stringify(p) : ''}`;
+  }
+  if (!window.__lastFrame || performance.now() - window.__lastFrame > 500) loop(performance.now());
+}, 250);
 function updMetrics() {
   document.getElementById('m_clicks').textContent = M.clicks;
   document.getElementById('m_bad').textContent = M.bad;
