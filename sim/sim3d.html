@@ -955,10 +955,10 @@ function syncScene() {
   if (HEADS === 'vostok' && vostokGeoms) {
     // real 20x20x500 tube + MGN9 rail from the model; tube STL is centered,
     // dy/dz measured from the nozzle in the assembly
-    if (!railMesh.userData.up) { vostokGeoms.tube.rotateY(Math.PI); railMesh.geometry = vostokGeoms.tube; railMesh.userData.up = true; }
+    if (!railMesh.userData.up) { railMesh.geometry = vostokGeoms.tube; railMesh.userData.up = true; }
     railMesh.position.set(BED.w/2, M.beam.z + VOSTOK_TUBE.dy, M.beam.y + VOSTOK_TUBE.dz);
     railMesh.visible = true;
-    vRailMesh.position.set(BED.w/2, M.beam.z + VOSTOK_TUBE.dy - 13, M.beam.y + VOSTOK_TUBE.dz);
+    vRailMesh.position.set(BED.w/2, M.beam.z + VOSTOK_TUBE.dy - 10 - 4.5, M.beam.y + VOSTOK_TUBE.dz);
     vRailMesh.visible = true;
   } else {
     rail.visible = true;
