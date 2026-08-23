@@ -195,6 +195,11 @@ class ToolOffsetSphere:
         safe = self._safe_z(ball_top)
         x0 = self.cx - self.sx/2.; x1 = self.cx + self.sx/2.
         y0 = self.cy - self.sy/2.; y1 = self.cy + self.sy/2.
+        # clamp the search rectangle to the machine's own axis bounds -
+        # an out-of-range grid point would abort the whole run
+        if self.bounds:
+            x0 = max(x0, self.bounds[0] + 2.); x1 = min(x1, self.bounds[1] - 2.)
+            y0 = max(y0, self.bounds[2] + 2.); y1 = min(y1, self.bounds[3] - 2.)
         pitches = self._scan_pitches()
         for pi, pitch in enumerate(pitches):
             xs, ys = [], []
