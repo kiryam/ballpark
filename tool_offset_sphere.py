@@ -42,6 +42,7 @@ class ToolOffsetSphere:
         self.climb_budget = config.getint('climb_budget', 350, minval=10)
         self.max_off_xy = config.getfloat('max_offset_xy', 15., above=1.)
         self.max_off_z = config.getfloat('max_offset_z', 5., above=0.5)
+        self.y_margin = config.getfloat('y_margin', 15., above=0.)
         self.esc_offsets = []
         for tok in config.get('escape_offsets', '-15,0 15,0').split():
             dx, dy = [float(v) for v in tok.split(',')]
@@ -52,10 +53,37 @@ class ToolOffsetSphere:
         self.switch_a = config.get('head_switch_a_gcode', 'T0')
         # axis bounds and auto parking (filled at run start)
         self.bounds = None
+        # homing_move computes the halt position from the steppers attached
+        # to the endstop; without any it returns the start position and the
+        # trigger arming misbehaves. Attach the Z rails (the probing axis)
+        # plus the IDEX primary X rail, like the old tools_calibrate did.
+        self.printer.register_event_handler("klippy:connect",
+                                            self._handle_connect)
+        self.printer.register_event_handler("klippy:ready",
+                                            self._handle_connect)
+    def _handle_connect(self, eventtime=None):
+        if getattr(self, '_steppers_attached', False):
+            return
+        try:
+            kin = self._toolhead().get_kinematics()
+        except Exception:
+            return
+        for st in kin.get_steppers():
+            # Z rails ONLY: probing_move's check_no_movement() requires every
+            # registered stepper to move during the probe - a vertical
+            # descent never moves X, so attaching stepper_x turns EVERY
+            # probe into "Probe triggered prior to movement"
+            if st.get_name().startswith('stepper_z'):
+                self.mcu_endstop.add_stepper(st)
+        self._steppers_attached = True
         self.gcode.register_command('TOOL_SPHERE_CALIBRATE', self.cmd_run,
                                     desc=self.cmd_run.__doc__)
         self.gcode.register_command('TOOL_SPHERE_QUERY_PROBE', self.cmd_query,
                                     desc="Ball probe state")
+        self.gcode.register_command('TOOL_SPHERE_NOISE_TEST', self.cmd_noise,
+                                    desc="Shake each axis and count probe flickers")
+        self.gcode.register_command('TOOL_SPHERE_PROBE_TEST', self.cmd_probetest,
+                                    desc="One probing_move down + up, with pin states")
     # ---------------- helpers ----------------
     def _log(self, msg, level=1):
         if level > self.log_level:
@@ -71,8 +99,17 @@ class ToolOffsetSphere:
         self._toolhead().manual_move([x, y, z], speed)
     def _safe_z(self, ball_top):
         return (ball_top + 2.5) if ball_top else self.safe_z_cold
+    def _bounds(self):
+        # axis bounds, filled lazily (any command can run first)
+        if self.bounds is None:
+            kin = self._toolhead().get_kinematics().get_status(
+                self.reactor.monotonic())
+            self.bounds = (kin['axis_minimum'][0], kin['axis_maximum'][0],
+                           kin['axis_minimum'][1], kin['axis_maximum'][1])
+        return self.bounds
     def _park(self, left):
-        x = (self.bounds[0] + 10.) if left else (self.bounds[1] - 10.)
+        b = self._bounds()
+        x = (b[0] + 10.) if left else (b[1] - 10.)
         return x
     def _probe_down(self, x, y, safe_z, tag=''):
         # 3-phase travel + descent to floor_z, stop on click.
@@ -87,6 +124,14 @@ class ToolOffsetSphere:
         self._move(x, y, tz, self.travel_speed)
         if tz > safe_z + .01:
             self._move(x, y, safe_z, self.lift_speed)
+        # settle: the ball lever rings for a few hundred ms after ANY move;
+        # arming the endstop mid-ring latches a false instant trigger
+        # ("Probe triggered prior to movement"). Let it decay first.
+        self._toolhead().dwell(0.4)
+        if self.mcu_endstop.query_endstop(self._toolhead().get_last_move_time()):
+            raise self.printer.command_error(
+                "ball probe reports TRIGGERED before the descent (pressed, "
+                "jammed or wrong polarity) - check the switch")
         phoming = self.printer.lookup_object('homing')
         attempts = 3
         while True:
@@ -97,14 +142,25 @@ class ToolOffsetSphere:
                 break
             except self.printer.command_error as e:
                 reason = str(e)
+                if "No trigger" in reason:
+                    # clean miss - the descent completed without a click
+                    self._log(". miss %s(%.1f,%.1f)" % (tag, x, y), 2)
+                    return None
                 if "prior to movement" in reason and attempts > 0:
-                    # wire glitch: wait and see if it releases
+                    # the lever has not swung back yet (or a bounce): wait
+                    # for a stable open state up to 2s, then retry
                     attempts -= 1
                     toolhead = self._toolhead()
-                    toolhead.dwell(0.1)
-                    if not self.mcu_endstop.query_endstop(
-                            toolhead.get_last_move_time()):
-                        self._log("probe pin glitch, retrying (%d left)"
+                    ok = False
+                    for _ in range(20):
+                        toolhead.dwell(0.1)
+                        if not self.mcu_endstop.query_endstop(
+                                toolhead.get_last_move_time()):
+                            ok = True
+                            break
+                    if ok:
+                        self._log("probe still pressed after the click - "
+                                  "waited for release, retrying (%d left)"
                                   % attempts)
                         continue
                 raise self.printer.command_error(reason)
@@ -119,6 +175,9 @@ class ToolOffsetSphere:
             self._log("!! probe triggered at travel height %.1f (%s) - "
                       "switch noise or the ball probe is off the bed" % (z, tag), 0)
             return None
+        # real click: give the ball lever time to swing back before the
+        # next probe arms (else the next start sees the pin still pressed)
+        self._toolhead().dwell(0.4)
         return (x, y, z)
     # ---------------- sphere math ----------------
     def _fit_sphere(self, pts):
@@ -199,7 +258,8 @@ class ToolOffsetSphere:
         # an out-of-range grid point would abort the whole run
         if self.bounds:
             x0 = max(x0, self.bounds[0] + 2.); x1 = min(x1, self.bounds[1] - 2.)
-            y0 = max(y0, self.bounds[2] + 2.); y1 = min(y1, self.bounds[3] - 2.)
+            y0 = max(y0, self.bounds[2] + self.y_margin)
+            y1 = min(y1, self.bounds[3] - self.y_margin)
         pitches = self._scan_pitches()
         for pi, pitch in enumerate(pitches):
             xs, ys = [], []
@@ -233,7 +293,8 @@ class ToolOffsetSphere:
         safe = self._safe_z(ball_top)
         xmin, xmax, ymin, ymax = self.bounds[0], self.bounds[1], self.bounds[2], self.bounds[3]
         clx = lambda v: max(xmin, min(xmax, v))
-        cly = lambda v: max(ymin, min(ymax, v))
+        cly = lambda v: max(ymin + self.y_margin,
+                             min(ymax - self.y_margin, v))
         while True:
             if clicks >= self.climb_budget:
                 self._log("climb budget (%d clicks) reached - settling on "
@@ -370,13 +431,102 @@ class ToolOffsetSphere:
         pt = toolhead.get_last_move_time()
         self.gcode.respond_info("ball probe: %s" % (
             "TRIGGERED" if self.mcu_endstop.query_endstop(pt) else "open"))
+    def cmd_noise(self, gcmd):
+        # Which motion shakes a false trigger out of the ball switch:
+        # wiggle one axis at a time and sample the endstop between moves.
+        toolhead = self._toolhead()
+        if toolhead.get_status(self.reactor.monotonic())['homed_axes'] != 'xyz':
+            raise gcmd.error("Home all axes first")
+        self._bounds()
+        pos = list(self._pos())
+        z_safe = max(pos[2], self.safe_z_cold)
+        def sample(n):
+            hits = 0
+            for _ in range(n):
+                toolhead.dwell(0.02)
+                if self.mcu_endstop.query_endstop(
+                        toolhead.get_last_move_time()):
+                    hits += 1
+            return hits
+        def wiggle(axis, delta, times):
+            hits = 0
+            for i in range(times):
+                v = pos[axis] + (delta if i % 2 == 0 else -delta)
+                p = list(self._pos()); p[axis] = v
+                self._toolhead().manual_move(p, 60.)
+                hits += sample(4)
+            return hits
+        res = {}
+        res['idle'] = sample(20)
+        # park away from the ball zone first (X edge, ball sits near center)
+        self._move(self._park(True), pos[1], z_safe, self.travel_speed)
+        pos = list(self._pos())
+        res['X_wiggle'] = wiggle(0, 3., 5)
+        res['Y_wiggle'] = wiggle(1, 3., 5)
+        res['Z_wiggle'] = wiggle(2, 1., 5)
+        # the real failure mode: 3 probe descents far from the ball
+        inst = 0
+        for _ in range(3):
+            hit = self._probe_down(self._park(True) + 10., pos[1],
+                                   z_safe, 'noise')
+            if hit is None and self._log:
+                pass
+        self.gcode.respond_info(
+            "noise test (flickers): idle %d/20, X %d/20, Y %d/20, Z %d/20"
+            % (res['idle'], res['X_wiggle'], res['Y_wiggle'], res['Z_wiggle']))
+    def cmd_probetest(self, gcmd):
+        # Decisive test: a downward probing_move that "clicks" at its very
+        # start while query_endstop says open AND an upward probing_move that
+        # "clicks" too = the hardware trigger path is misbehaving, not the
+        # switch. Prints pin state before/after each attempt.
+        toolhead = self._toolhead()
+        if toolhead.get_status(self.reactor.monotonic())['homed_axes'] != 'xyz':
+            raise gcmd.error("Home all axes first")
+        self._bounds()
+        phoming = self.printer.lookup_object('homing')
+        pos = list(self._pos())
+        if pos[2] < self.safe_z_cold:
+            self._move(pos[0], pos[1], self.safe_z_cold, self.lift_speed)
+            pos = list(self._pos())
+        def q(tag):
+            v = self.mcu_endstop.query_endstop(
+                toolhead.get_last_move_time())
+            self.gcode.respond_info("// %s: query=%s" % (tag, v))
+            return v
+        for i in range(3):
+            q("down %d before" % i)
+            p0 = list(self._pos())
+            try:
+                epos = phoming.probing_move(self.mcu_endstop,
+                                            [p0[0], p0[1], p0[2] - 2.],
+                                            self.probe_speed)
+            except self.printer.command_error as e2:
+                q("down %d after" % i)
+                self.gcode.respond_info(
+                    "// down %d: clean miss (no trigger): %s" % (i, e2))
+                self._move(p0[0], p0[1], p0[2], self.lift_speed)
+                continue
+            q("down %d after" % i)
+            self.gcode.respond_info(
+                "// down %d: start Z%.3f -> reported Z%.3f (triggered at +%0.3fmm)"
+                % (i, p0[2], epos[2], p0[2] - epos[2]))
+            # lift back
+            self._move(p0[0], p0[1], p0[2], self.lift_speed)
+            q("up %d before" % i)
+            p1 = list(self._pos())
+            epos2 = phoming.probing_move(self.mcu_endstop,
+                                         [p1[0], p1[1], p1[2] + 2.],
+                                         self.probe_speed)
+            q("up %d after" % i)
+            self.gcode.respond_info(
+                "// up %d: start Z%.3f -> reported Z%.3f"
+                % (i, p1[2], epos2[2]))
+            self._move(p1[0], p1[1], p1[2], self.lift_speed)
     def cmd_run(self, gcmd):
         toolhead = self._toolhead()
         if toolhead.get_status(self.reactor.monotonic())['homed_axes'] != 'xyz':
             raise gcmd.error("Home all axes first")
-        kin = toolhead.get_kinematics().get_status(self.reactor.monotonic())
-        self.bounds = (kin['axis_minimum'][0], kin['axis_maximum'][0],
-                       kin['axis_minimum'][1], kin['axis_maximum'][1])
+        self._bounds()
         ball_top = gcmd.get_float('BALL_TOP', self.ball_top, minval=0.)
         dry = gcmd.get_int('DRY_RUN', 0)
         self._log("=== ball-probe offset calibration (sphere v8) ===")
