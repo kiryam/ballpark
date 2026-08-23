@@ -38,6 +38,8 @@ class ToolOffsetSphere:
         self.cy = config.getfloat('search_center_y', 35.)
         self.sx = config.getfloat('search_size_x', 160., above=20.)
         self.sy = config.getfloat('search_size_y', 120., above=20.)
+        self.log_level = config.getint('log_level', 1, minval=0, maxval=2)
+        self.climb_budget = config.getint('climb_budget', 350, above=10)
         self.esc_offsets = []
         for tok in config.get('escape_offsets', '-15,0 15,0').split():
             dx, dy = [float(v) for v in tok.split(',')]
@@ -54,6 +56,8 @@ class ToolOffsetSphere:
                                     desc="Ball probe state")
     # ---------------- helpers ----------------
     def _log(self, msg, level=1):
+        if level > self.log_level:
+            return
         prefix = {0: '!!', 1: '//', 2: '##'}[min(level, 2)]
         self.gcode.respond_raw("%s %s" % (prefix, msg))
     def _toolhead(self):
@@ -205,13 +209,24 @@ class ToolOffsetSphere:
         # Returns the best click (x, y, z) and nozzle-point samples for the fit
         samples = []
         cur = best; d = 4.
+        clicks = 0
         safe = self._safe_z(ball_top)
         xmin, xmax, ymin, ymax = self.bounds[0], self.bounds[1], self.bounds[2], self.bounds[3]
         clx = lambda v: max(xmin, min(xmax, v))
         cly = lambda v: max(ymin, min(ymax, v))
         while True:
+            if clicks >= self.climb_budget:
+                self._log("climb budget (%d clicks) reached - settling on "
+                          "the best click (a real ball settles slightly "
+                          "between presses, so the climb self-terminates)"
+                          % self.climb_budget, 0)
+                break
+            if clicks and clicks % 25 == 0:
+                self._log("climb: %d clicks, best Z%.2f at %.1f,%.1f"
+                          % (clicks, cur[2], cur[0], cur[1]))
             probes = []
             for (dx, dy) in ((1,0),(-1,0),(0,1),(0,-1)):
+                clicks += 1
                 hit = self._probe_down(clx(cur[0]+dx*d), cly(cur[1]+dy*d), safe, 'climb')
                 if hit:
                     samples.append(hit); probes.append(hit)
@@ -233,6 +248,7 @@ class ToolOffsetSphere:
             for rr in (5., 9., 14., 20.):
                 for k in range(8):
                     a = k/8.*2.*math.pi
+                    clicks += 1
                     hit = self._probe_down(clx(cur[0]+rr*math.cos(a)),
                                            cly(cur[1]+rr*math.sin(a)), safe, 'ring')
                     if hit:
@@ -245,6 +261,7 @@ class ToolOffsetSphere:
             # jumps along element offsets (known head geometry)
             jumped = None
             for (dx, dy) in self.esc_offsets:
+                clicks += 1
                 hit = self._probe_down(clx(cur[0]+dx), cly(cur[1]+dy), safe, 'jump')
                 if hit and hit[2] > cur[2] - 1.0:
                     samples.append(hit); jumped = hit; break
