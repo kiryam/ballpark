@@ -40,6 +40,8 @@ class ToolOffsetSphere:
         self.sy = config.getfloat('search_size_y', 120., above=20.)
         self.log_level = config.getint('log_level', 1, minval=0, maxval=2)
         self.climb_budget = config.getint('climb_budget', 350, minval=10)
+        self.max_off_xy = config.getfloat('max_offset_xy', 15., above=1.)
+        self.max_off_z = config.getfloat('max_offset_z', 5., above=0.5)
         self.esc_offsets = []
         for tok in config.get('escape_offsets', '-15,0 15,0').split():
             dx, dy = [float(v) for v in tok.split(',')]
@@ -109,6 +111,13 @@ class ToolOffsetSphere:
         z = epos[2]
         if z <= self.floor_z + 0.01:
             self._log(". miss %s(%.1f,%.1f)" % (tag, x, y), 2)
+            return None
+        if z >= safe_z - 1.5:
+            # triggered right at the travel height: the switch is not on the
+            # ball - noise or a knocked-off/unplugged probe. Never treat as
+            # a ball contact (it used to poison the whole calibration).
+            self._log("!! probe triggered at travel height %.1f (%s) - "
+                      "switch noise or the ball probe is off the bed" % (z, tag), 0)
             return None
         return (x, y, z)
     # ---------------- sphere math ----------------
@@ -403,6 +412,16 @@ class ToolOffsetSphere:
         # --- offset ---
         off = (apex_b[0]-apex_a2[0], apex_b[1]-apex_a2[1], apex_b[2]-apex_a2[2])
         self._log("MEASURED B offset: dX%.3f dY%.3f dZ%.3f" % off, 1)
+        if (abs(off[0]) > self.max_off_xy or abs(off[1]) > self.max_off_xy
+                or abs(off[2]) > self.max_off_z):
+            # way outside what a head drift can be: the run was corrupted
+            # (probe knocked the ball off / false triggers). NEVER apply.
+            raise gcmd.error(
+                "Measured offset dX%.2f dY%.2f dZ%.2f exceeds the plausible "
+                "range (+/-%.0f XY, +/-%.0f Z) - the ball was probably "
+                "knocked off mid-run or the switch false-triggered. "
+                "Offsets NOT applied." % (off + (self.max_off_xy,
+                                                 self.max_off_z)))
         if dry:
             self._log("DRY_RUN: offsets are not applied", 1)
             return
