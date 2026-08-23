@@ -39,7 +39,7 @@ class ToolOffsetSphere:
         self.sx = config.getfloat('search_size_x', 160., above=20.)
         self.sy = config.getfloat('search_size_y', 120., above=20.)
         self.log_level = config.getint('log_level', 1, minval=0, maxval=2)
-        self.climb_budget = config.getint('climb_budget', 350, above=10)
+        self.climb_budget = config.getint('climb_budget', 350, minval=10)
         self.esc_offsets = []
         for tok in config.get('escape_offsets', '-15,0 15,0').split():
             dx, dy = [float(v) for v in tok.split(',')]
@@ -78,7 +78,13 @@ class ToolOffsetSphere:
         pos = self._pos()
         if pos[2] < safe_z - .01:
             self._move(pos[0], pos[1], safe_z, self.lift_speed)
-        self._move(x, y, safe_z, self.travel_speed)
+        # travel at the CURRENT height if it is higher (e.g. the T1 macro's
+        # z-hop) - never descend while moving XY: head B's nozzle sits
+        # lower than A's by an unknown dZ and could plane through the ball
+        tz = max(pos[2], safe_z)
+        self._move(x, y, tz, self.travel_speed)
+        if tz > safe_z + .01:
+            self._move(x, y, safe_z, self.lift_speed)
         phoming = self.printer.lookup_object('homing')
         attempts = 3
         while True:
@@ -279,6 +285,30 @@ class ToolOffsetSphere:
                 if hit:
                     samples.append(hit)
         return samples
+    def _seed_b(self, apex, ball_top):
+        # Find the ball again with head B. B's nozzle offset is exactly what
+        # we are calibrating, so do NOT press at A's apex directly and do NOT
+        # travel at the tight A-margin: scan a small serpentine around the
+        # apex at a tall margin (B's dZ is unknown), vertical descents only.
+        # The first click seeds the climb, which refines from there.
+        safe_hi = ball_top + 8.
+        self._log("head B: local scan around apex A (tall margin Z%.1f)"
+                  % safe_hi)
+        pitch = 10.
+        pts = []
+        for iy, dy in enumerate((20., 10., 0., -10., -20.)):
+            row = (-20., -10., 0., 10., 20.)
+            if iy % 2:
+                row = row[::-1]
+            for dx in row:
+                pts.append((apex[0] + dx, apex[1] + dy))
+        for (x, y) in pts:
+            seed = self._probe_down(x, y, safe_hi, 'Bscan')
+            if seed:
+                self._log("head B: first click at %.1f,%.1f (Z%.2f)"
+                          % seed)
+                return seed
+        return None
     def _measure(self, seed_hit, ball_top):
         # climb -> rings -> fit -> verify. Returns the apex (x,y,z)
         best, samples = self._climb(seed_hit, ball_top)
@@ -354,13 +384,7 @@ class ToolOffsetSphere:
         self._move(apex_a[0], apex_a[1], travel_z(), self.lift_speed)
         self._move(self._park(True), apex_a[1], travel_z(), self.travel_speed)
         self.gcode.run_script_from_command(self.switch_b)
-        seed = self._probe_down(apex_a[0], apex_a[1],
-                                self._safe_z(ball_top), 'B')
-        if not seed:
-            for (dx, dy) in ((6,0),(-6,0),(0,6),(0,-6)):
-                seed = self._probe_down(apex_a[0]+dx, apex_a[1]+dy,
-                                        self._safe_z(ball_top), 'B?')
-                if seed: break
+        seed = self._seed_b(apex_a, ball_top)
         if not seed:
             raise gcmd.error("Head B did not find the ball near apex A")
         apex_b = self._measure(seed, ball_top)
