@@ -148,18 +148,24 @@ const PIN_ZP = +(new URLSearchParams(location.search).get('zp') ?? (location.sea
 function els(headB) {
   const d = headB ? geo.bl : 0;
   if (HEADS === 'vostok') {
-    // measured from the Fusion vostok_v9.4 assembly (Bereza printhead,
-    // Goliath Air hotend). The nozzle is the lowest point (as on any
-    // printable toolhead); the part-cooling ducts are narrow tubes BESIDE
-    // and BEHIND it (dx -17 and -27), a little higher - side traps like
-    // the StealthBurner ducts, so the proven escape logic applies.
+    // All discs MEASURED from the actual STL meshes (parsed + the loader
+    // transform + the corrected manifest): tip cone at the origin, cone
+    // widening to r4.2 by +2.5mm, heater block r6.6 from +5mm. The L cool
+    // duct tip REALLY hangs 1.7mm BELOW the nozzle at dx -26.3; the R duct
+    // tip is at (+10.2, +14.2) at +2.25mm; shroud rims run along dy +-13..14.
     const e0 = [
-      {name:'nozzle', dx:0, dy:0, r:0.4, zo:0},
-      {name:'sock', dx:0, dy:0, r:6, zo:1.5 + d},
-      {name:'block', dx:0, dy:0, r:11, zo:4.5 + d},
-      {name:'duct tube 1', dx:-17, dy:2, r:4.5, zo:1.2 + d},
-      {name:'duct tube 2', dx:-27, dy:2, r:4, zo:1.8 + d},
+      {name:'nozzle', dx:0, dy:0, r:0.7, zo:0},          // STL tip cone
+      {name:'sock', dx:0, dy:0, r:4.2, zo:2.5 + d},      // cone -> heater
+      {name:'block', dx:0, dy:0, r:6.6, zo:5 + d},       // heater block
     ];
+    if (headB) e0.push(
+      {name:'duct R', dx:10.2, dy:14.2, r:2.5, zo:2.25 + d},
+      {name:'shroud R front', dx:0, dy:13, r:4, zo:3.2 + d},
+      {name:'shroud R rear', dx:0, dy:-13, r:4, zo:3.2 + d});
+    else e0.push(
+      {name:'duct L', dx:-26.3, dy:0, r:2.5, zo:-1.7},   // BELOW the tip!
+      {name:'shroud L front', dx:0, dy:14.2, r:5, zo:3.2 + d},
+      {name:'shroud L rear', dx:0, dy:-14.2, r:5, zo:3.2 + d});
     // BLTouch: during calibration its pin is RETRACTED, so the nozzle stays
     // the lowest point; only the body matters - beside the nozzle, above the tip
     e0.push({name:'bltouch body', dx:-24, dy:-6, r:3, zo:9 + d});
@@ -352,7 +358,9 @@ const M = {
       // large safe step: the whole head is above the ball top and not descending
       const wNow = this.world();
       const above = (wNow.z - (BALL_CZ + BALL_R) > 1) && dz >= -1e-9;
-      const chunk = (above || prevGap > 30) ? 25 : 0.5;
+      // fine substeps near the surface: a coarse step overshoots the contact
+      // and visually penetrates the ball before minGap catches it
+      const chunk = (above || prevGap > 30) ? 25 : (prevGap < 2 ? 0.15 : 0.5);
       const s = Math.min(step, chunk, len - done);
       done += s; step -= s;
       this.setPos(pos.x + dx/len*done, pos.y + dy/len*done, pos.z + dz/len*done);
@@ -757,30 +765,31 @@ let sbGeometry = null;
 //   three.x = fx - fNozzle.x, three.y = fy - fNozzle.y (up), three.z = -(fz - fNozzle.z)
 // each STL is centered on its own bbox in JS, so only the delta matters.
 const VOSTOK_PARTS = {
-  // mm relative to the nozzle in SIM axes (x right, y up, z front),
-  // mapped from Fusion assembly centers: three = (fx-Nx, fz-Nz, -(fy-Ny))
-  // [Fusion: X beam, Z UP, Y depth, front = -Y]
+  // mm relative to the nozzle in SIM axes (x right, y up, z front).
+  // Fusion-derived centers were off by (+0.16, 0, +11.58) vs the real tip -
+  // corrected by MEASURING the STLs through the loader transform, so the
+  // visible hotend tip now sits exactly on the physics nozzle (0,0,0).
   L: [ // nozzle (Fusion world): (45.0, -6.22, -9.35) cm
-    ['vL_body.stl',    0,     73.5,  -6.7],   // Bereza body, Goliath 4010
-    ['vL_hotend.stl',  0,     37.4, -18.6],
-    ['vL_cool.stl',  -11.05,  81.5, -11.05],
-    ['vL_mf.stl',      0,    111.0, -28.2],
-    ['vL_carr.stl',   -5.5,  110.0, -50.7],
-    ['vL_fan.stl',     0,     73.5,  17.3, Math.PI],  // 180-deg part flip
-    ['vL_spacer.stl',  0,     71.5, -67.7],
+    ['vL_body.stl',   0.16,  73.5,   4.88],
+    ['vL_hotend.stl', 0.16,  37.4,  -7.02],   // tip at the origin (measured)
+    ['vL_cool.stl',  -10.89, 81.5,   0.53],
+    ['vL_mf.stl',     0.16, 111.0, -16.62],
+    ['vL_carr.stl',  -5.34, 110.0, -39.12],
+    ['vL_fan.stl',    0.16,  73.5,  28.88, Math.PI],
+    ['vL_spacer.stl', 0.16,  71.5, -56.12],
   ],
   R: [ // nozzle: (50.5, -6.22, -9.35) cm
-    ['vR_body.stl',    0,     73.5,  -6.7],
-    ['vR_hotend.stl',  0,     37.4, -18.6],
-    ['vR_cool.stl',   10.5,  83.5, -11.05],
-    ['vR_mf.stl',      0,    111.0, -28.2],
-    ['vR_carr.stl',    5.5,  110.0, -50.7],
-    ['vR_fan.stl',     0,     73.5,  17.3, Math.PI],
-    ['vL_spacer.stl',  0,     71.5, -67.7],   // spacer shared L/R
+    ['vR_body.stl',    0.16,  73.5,   4.88],
+    ['vR_hotend.stl',  0.16,  37.4,  -7.02],
+    ['vR_cool.stl',   10.66,  83.5,   0.53],
+    ['vR_mf.stl',      0.16, 111.0, -16.62],
+    ['vR_carr.stl',    5.66, 110.0, -39.12],
+    ['vR_fan.stl',     0.16,  73.5,  28.88, Math.PI],
+    ['vL_spacer.stl',  0.16,  71.5, -56.12],   // spacer shared L/R
   ],
 };
-const VOSTOK_TUBE = {file: 'vostok_x_tube.stl', len: 500, dy: 71.5, dz: -51.7}; // vs nozzle (y up, z front)
-const SIM_VER = 'v81';
+const VOSTOK_TUBE = {file: 'vostok_x_tube.stl', len: 500, dy: 71.5, dz: -40.12}; // vs nozzle (y up, z front)
+const SIM_VER = 'v82';
 const VBUST = Date.now() % 1000000;
 document.getElementById('hudver').textContent = SIM_VER + ' (green dot = a click the physics engine attributed to the NOZZLE disc at the head origin; if the mesh visibly disagrees, the STL placement is wrong - report it)';
 let vostokGeoms = null;
