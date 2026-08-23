@@ -702,9 +702,13 @@ camera.position.set(320, 420, 520);
 const controls = new OrbitControls(camera, renderer.domElement);
 // ?cam=close - start near the ball (mark-verification view)
 const CAM_CLOSE = new URLSearchParams(location.search).get('cam') === 'close';
+// chase cam: re-frame when the ball moves to another test pose, but the
+// moment the user touches the camera (orbit/zoom/pan) the chase yields and
+// does not fight the input; it re-engages on the next ball relocation
+let chaseUser = false;
+const chaseLast = {x: ball.x, y: ball.y};
+controls.addEventListener('start', () => { chaseUser = true; });
 if (CAM_CLOSE) {
-  // scene coords are (x, z-up, y) - see ballMesh.position.set(ball.x, BALL_CZ, ball.y).
-  // Chase cam: the harness moves the ball between poses, so re-aim every frame.
   camera.position.set(ball.x + 60, BALL_CZ + 55, ball.y + 90);
   controls.target.set(ball.x, BALL_CZ, ball.y);
 }
@@ -776,7 +780,7 @@ const VOSTOK_PARTS = {
   ],
 };
 const VOSTOK_TUBE = {file: 'vostok_x_tube.stl', len: 500, dy: 71.5, dz: -51.7}; // vs nozzle (y up, z front)
-const SIM_VER = 'v80';
+const SIM_VER = 'v81';
 const VBUST = Date.now() % 1000000;
 document.getElementById('hudver').textContent = SIM_VER + ' (green dot = a click the physics engine attributed to the NOZZLE disc at the head origin; if the mesh visibly disagrees, the STL placement is wrong - report it)';
 let vostokGeoms = null;
@@ -1224,9 +1228,13 @@ function loop(t) {
     updMetrics();
   }
   if (CAM_CLOSE) {
-    // keep the close-up framed on the ball even after test-pose moves
-    controls.target.set(ball.x, BALL_CZ, ball.y);
-    camera.position.set(ball.x + 60, BALL_CZ + 55, ball.y + 90);
+    if (Math.hypot(ball.x - chaseLast.x, ball.y - chaseLast.y) > 1) {
+      chaseLast.x = ball.x; chaseLast.y = ball.y; chaseUser = false;
+    }
+    if (!chaseUser) {
+      controls.target.set(ball.x, BALL_CZ, ball.y);
+      camera.position.set(ball.x + 60, BALL_CZ + 55, ball.y + 90);
+    }
   }
   try {
     syncScene();
@@ -1292,7 +1300,7 @@ setInterval(() => {
     const p = window.__probe || {};
     let vis = 0, pooled = marksGroup ? marksGroup.children.length : -1;
     if (marksGroup) for (const c of marksGroup.children) if (c.visible) vis++;
-    dbg.textContent = `${document.visibilityState} · frames ${window.__frames||0} · marks g${mc.g} o${mc.o} r${mc.r} v${mc.v} · vis ${vis}${PXDBG ? ' · px ' + JSON.stringify(p) : ''}`;
+    dbg.textContent = `${document.visibilityState} · frames ${window.__frames||0} · marks g${mc.g} o${mc.o} r${mc.r} v${mc.v} · vis ${vis} · cam ${chaseUser ? 'user' : 'chase'} ${camera.position.x.toFixed(0)}/${camera.position.y.toFixed(0)}/${camera.position.z.toFixed(0)}${PXDBG ? ' · px ' + JSON.stringify(p) : ''}`;
   }
   if (!window.__lastFrame || performance.now() - window.__lastFrame > 500) loop(performance.now());
 }, 250);
