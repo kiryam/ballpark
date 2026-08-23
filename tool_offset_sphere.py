@@ -168,10 +168,12 @@ class ToolOffsetSphere:
         if z <= self.floor_z + 0.01:
             self._log(". miss %s(%.1f,%.1f)" % (tag, x, y), 2)
             return None
-        if z >= safe_z - 1.5:
+        if z >= safe_z - 0.2:
             # triggered right at the travel height: the switch is not on the
             # ball - noise or a knocked-off/unplugged probe. Never treat as
             # a ball contact (it used to poison the whole calibration).
+            # NOTE: only a hair below the travel height is impossible - head
+            # B presses in its own frame and its dZ (a few mm) is legitimate
             self._log("!! probe triggered at travel height %.1f (%s) - "
                       "switch noise or the ball probe is off the bed" % (z, tag), 0)
             return None
@@ -560,8 +562,16 @@ class ToolOffsetSphere:
                                 self._safe_z(ball_top), 'revision')
         apex_a2 = self._measure(seed, ball_top) if seed else apex_a
         drift = math.dist(apex_a, apex_a2)
+        if drift > 2.0:
+            # the ball walked mid-run (head B pressed its shoulder): every
+            # apex was measured at a different ball position - the offset
+            # would be garbage. Refuse; the probe must sit secure on the bed
+            raise gcmd.error(
+                "Ball moved %.2fmm during the run - the measurement is "
+                "invalid. Secure the ball probe on the bed (tape/magnet/"
+                "holder) and rerun. Offsets NOT applied." % drift)
         if drift > 0.2:
-            self._log("ball moved between passes (drift %.2fmm) - "
+            self._log("ball moved slightly between passes (drift %.2fmm) - "
                       "offset from the revision" % drift, 0)
         self._log("apex A (revision): X%.2f Y%.2f Z%.2f" % apex_a2, 1)
         # --- offset ---
