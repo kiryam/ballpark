@@ -145,34 +145,457 @@ function mulberry32(a) { return function() { a |= 0; a = a + 0x6D2B79F5 | 0; let
 // HEADS: 'vostok' (real Bereza geometry measured from the Fusion model) or 'sb'
 const HEADS = new URLSearchParams(location.search).get('heads') || 'vostok';
 const PIN_ZP = +(new URLSearchParams(location.search).get('zp') ?? (location.search.includes('test=pin') ? 0 : 1));
+// mesh-true collision cells, generated offline from the STL vertices of the
+// corrected assembly (2mm XY grid; each disc sits at its cell's lowest
+// point, radius covers the cell). They make the physics follow the REAL
+// silhouettes - the hotend cone flank and the cool shroud cannot sink into
+// the ball visually anymore. Collision-only (mesh:true): the offset-jump
+// logic skips them. Cells within 2.3mm of the axis are dropped so the cone
+// flank never steals the nozzle's apex clicks.
+const MESH_CELLS_L = [
+      {name:'shroud', dx:-30.0, dy:-8.0, r:1.5, zo:3.83, mesh:true},
+      {name:'shroud', dx:-30.0, dy:-10.0, r:1.5, zo:3.72, mesh:true},
+      {name:'shroud', dx:-30.0, dy:-12.0, r:1.5, zo:8.14, mesh:true},
+      {name:'shroud', dx:-30.0, dy:-14.0, r:1.5, zo:3.72, mesh:true},
+      {name:'shroud', dx:-26.0, dy:-10.0, r:1.5, zo:-0.72, mesh:true},
+      {name:'shroud', dx:-26.0, dy:-12.0, r:1.5, zo:-1.72, mesh:true},
+      {name:'shroud', dx:-24.0, dy:-10.0, r:1.5, zo:-0.72, mesh:true},
+      {name:'shroud', dx:-24.0, dy:-12.0, r:1.5, zo:-0.72, mesh:true},
+      {name:'shroud', dx:-20.0, dy:10.0, r:1.5, zo:4.56, mesh:true},
+      {name:'shroud', dx:-20.0, dy:-8.0, r:1.5, zo:4.22, mesh:true},
+      {name:'shroud', dx:-20.0, dy:-10.0, r:1.5, zo:3.72, mesh:true},
+      {name:'shroud', dx:-20.0, dy:-14.0, r:1.5, zo:3.72, mesh:true},
+      {name:'shroud', dx:-18.0, dy:-38.0, r:1.5, zo:6.16, mesh:true},
+      {name:'shroud', dx:-16.0, dy:14.0, r:1.5, zo:8.47, mesh:true},
+      {name:'shroud', dx:-14.0, dy:14.0, r:1.5, zo:8.01, mesh:true},
+      {name:'shroud', dx:-14.0, dy:12.0, r:1.5, zo:7.66, mesh:true},
+      {name:'shroud', dx:-14.0, dy:10.0, r:1.5, zo:8.61, mesh:true},
+      {name:'shroud', dx:-12.0, dy:16.0, r:1.5, zo:8.93, mesh:true},
+      {name:'shroud', dx:-12.0, dy:14.0, r:1.5, zo:7.49, mesh:true},
+      {name:'shroud', dx:-12.0, dy:12.0, r:1.5, zo:6.95, mesh:true},
+      {name:'shroud', dx:-12.0, dy:-34.0, r:1.5, zo:8.67, mesh:true},
+      {name:'shroud', dx:-12.0, dy:-36.0, r:1.5, zo:7.74, mesh:true},
+      {name:'shroud', dx:-10.0, dy:16.0, r:1.5, zo:8.48, mesh:true},
+      {name:'shroud', dx:-10.0, dy:14.0, r:1.5, zo:7.26, mesh:true},
+      {name:'shroud', dx:-10.0, dy:12.0, r:1.5, zo:6.33, mesh:true},
+      {name:'shroud', dx:-10.0, dy:10.0, r:1.5, zo:5.51, mesh:true},
+      {name:'shroud', dx:-10.0, dy:8.0, r:1.5, zo:6.85, mesh:true},
+      {name:'shroud', dx:-10.0, dy:2.0, r:1.5, zo:2.22, mesh:true},
+      {name:'shroud', dx:-10.0, dy:-24.0, r:1.5, zo:6.97, mesh:true},
+      {name:'shroud', dx:-10.0, dy:-26.0, r:1.5, zo:2.22, mesh:true},
+      {name:'shroud', dx:-10.0, dy:-32.0, r:1.5, zo:5.78, mesh:true},
+      {name:'shroud', dx:-10.0, dy:-34.0, r:1.5, zo:6.03, mesh:true},
+      {name:'shroud', dx:-10.0, dy:-36.0, r:1.5, zo:7.35, mesh:true},
+      {name:'shroud', dx:-10.0, dy:-38.0, r:1.5, zo:8.75, mesh:true},
+      {name:'shroud', dx:-8.0, dy:16.0, r:1.5, zo:8.19, mesh:true},
+      {name:'shroud', dx:-8.0, dy:14.0, r:1.5, zo:7.11, mesh:true},
+      {name:'shroud', dx:-8.0, dy:12.0, r:1.5, zo:6.29, mesh:true},
+      {name:'shroud', dx:-8.0, dy:10.0, r:1.5, zo:5.41, mesh:true},
+      {name:'shroud', dx:-8.0, dy:8.0, r:1.5, zo:4.74, mesh:true},
+      {name:'shroud', dx:-8.0, dy:6.0, r:1.5, zo:6.61, mesh:true},
+      {name:'shroud', dx:-8.0, dy:2.0, r:1.5, zo:2.77, mesh:true},
+      {name:'shroud', dx:-8.0, dy:-24.0, r:1.5, zo:6.02, mesh:true},
+      {name:'shroud', dx:-8.0, dy:-26.0, r:1.5, zo:3.00, mesh:true},
+      {name:'shroud', dx:-8.0, dy:-30.0, r:1.5, zo:4.74, mesh:true},
+      {name:'shroud', dx:-8.0, dy:-32.0, r:1.5, zo:5.11, mesh:true},
+      {name:'shroud', dx:-8.0, dy:-34.0, r:1.5, zo:6.02, mesh:true},
+      {name:'shroud', dx:-8.0, dy:-36.0, r:1.5, zo:7.08, mesh:true},
+      {name:'shroud', dx:-8.0, dy:-38.0, r:1.5, zo:8.18, mesh:true},
+      {name:'shroud', dx:-6.0, dy:16.0, r:1.5, zo:8.11, mesh:true},
+      {name:'shroud', dx:-6.0, dy:14.0, r:1.5, zo:7.09, mesh:true},
+      {name:'shroud', dx:-6.0, dy:12.0, r:1.5, zo:6.17, mesh:true},
+      {name:'shroud', dx:-6.0, dy:10.0, r:1.5, zo:5.43, mesh:true},
+      {name:'shroud', dx:-6.0, dy:8.0, r:1.5, zo:4.88, mesh:true},
+      {name:'shroud', dx:-6.0, dy:6.0, r:1.5, zo:7.59, mesh:true},
+      {name:'cone', dx:-6.0, dy:-8.0, r:1.5, zo:5.40, mesh:true},
+      {name:'cone', dx:-6.0, dy:-10.0, r:1.5, zo:4.53, mesh:true},
+      {name:'cone', dx:-6.0, dy:-12.0, r:1.5, zo:4.53, mesh:true},
+      {name:'cone', dx:-6.0, dy:-14.0, r:1.5, zo:5.40, mesh:true},
+      {name:'shroud', dx:-6.0, dy:-30.0, r:1.5, zo:4.74, mesh:true},
+      {name:'shroud', dx:-6.0, dy:-32.0, r:1.5, zo:5.13, mesh:true},
+      {name:'shroud', dx:-6.0, dy:-34.0, r:1.5, zo:5.92, mesh:true},
+      {name:'shroud', dx:-6.0, dy:-36.0, r:1.5, zo:6.92, mesh:true},
+      {name:'shroud', dx:-6.0, dy:-38.0, r:1.5, zo:7.84, mesh:true},
+      {name:'shroud', dx:-6.0, dy:-40.0, r:1.5, zo:8.87, mesh:true},
+      {name:'shroud', dx:-4.0, dy:18.0, r:1.5, zo:8.87, mesh:true},
+      {name:'shroud', dx:-4.0, dy:16.0, r:1.5, zo:7.83, mesh:true},
+      {name:'shroud', dx:-4.0, dy:14.0, r:1.5, zo:7.04, mesh:true},
+      {name:'shroud', dx:-4.0, dy:12.0, r:1.5, zo:6.11, mesh:true},
+      {name:'shroud', dx:-4.0, dy:10.0, r:1.5, zo:5.41, mesh:true},
+      {name:'shroud', dx:-4.0, dy:8.0, r:1.5, zo:4.74, mesh:true},
+      {name:'shroud', dx:-4.0, dy:6.0, r:1.5, zo:7.59, mesh:true},
+      {name:'shroud', dx:-4.0, dy:2.0, r:1.5, zo:3.17, mesh:true},
+      {name:'cone', dx:-4.0, dy:-6.0, r:1.5, zo:5.40, mesh:true},
+      {name:'cone', dx:-4.0, dy:-8.0, r:1.5, zo:4.53, mesh:true},
+      {name:'cone', dx:-4.0, dy:-10.0, r:1.5, zo:2.03, mesh:true},
+      {name:'cone', dx:-4.0, dy:-12.0, r:1.5, zo:2.03, mesh:true},
+      {name:'cone', dx:-4.0, dy:-14.0, r:1.5, zo:4.53, mesh:true},
+      {name:'cone', dx:-4.0, dy:-16.0, r:1.5, zo:4.53, mesh:true},
+      {name:'shroud', dx:-4.0, dy:-24.0, r:1.5, zo:6.02, mesh:true},
+      {name:'shroud', dx:-4.0, dy:-26.0, r:1.5, zo:3.17, mesh:true},
+      {name:'shroud', dx:-4.0, dy:-30.0, r:1.5, zo:4.74, mesh:true},
+      {name:'shroud', dx:-4.0, dy:-32.0, r:1.5, zo:5.11, mesh:true},
+      {name:'shroud', dx:-4.0, dy:-34.0, r:1.5, zo:5.89, mesh:true},
+      {name:'shroud', dx:-4.0, dy:-36.0, r:1.5, zo:6.76, mesh:true},
+      {name:'shroud', dx:-4.0, dy:-38.0, r:1.5, zo:7.68, mesh:true},
+      {name:'shroud', dx:-4.0, dy:-40.0, r:1.5, zo:8.53, mesh:true},
+      {name:'shroud', dx:-2.0, dy:18.0, r:1.5, zo:8.79, mesh:true},
+      {name:'shroud', dx:-2.0, dy:16.0, r:1.5, zo:7.78, mesh:true},
+      {name:'shroud', dx:-2.0, dy:14.0, r:1.5, zo:6.90, mesh:true},
+      {name:'shroud', dx:-2.0, dy:12.0, r:1.5, zo:6.16, mesh:true},
+      {name:'shroud', dx:-2.0, dy:10.0, r:1.5, zo:5.41, mesh:true},
+      {name:'shroud', dx:-2.0, dy:8.0, r:1.5, zo:4.49, mesh:true},
+      {name:'shroud', dx:-2.0, dy:6.0, r:1.5, zo:3.96, mesh:true},
+      {name:'shroud', dx:-2.0, dy:4.0, r:1.5, zo:3.42, mesh:true},
+      {name:'shroud', dx:-2.0, dy:2.0, r:1.5, zo:3.17, mesh:true},
+      {name:'cone', dx:-2.0, dy:-6.0, r:1.5, zo:4.53, mesh:true},
+      {name:'cone', dx:-2.0, dy:-8.0, r:1.5, zo:2.03, mesh:true},
+      {name:'cone', dx:-2.0, dy:-10.0, r:1.5, zo:2.03, mesh:true},
+      {name:'cone', dx:-2.0, dy:-12.0, r:1.5, zo:2.03, mesh:true},
+      {name:'cone', dx:-2.0, dy:-14.0, r:1.5, zo:2.03, mesh:true},
+      {name:'cone', dx:-2.0, dy:-16.0, r:1.5, zo:4.53, mesh:true},
+      {name:'cone', dx:-2.0, dy:-18.0, r:1.5, zo:5.40, mesh:true},
+      {name:'shroud', dx:-2.0, dy:-24.0, r:1.5, zo:6.02, mesh:true},
+      {name:'shroud', dx:-2.0, dy:-26.0, r:1.5, zo:3.17, mesh:true},
+      {name:'shroud', dx:-2.0, dy:-28.0, r:1.5, zo:3.42, mesh:true},
+      {name:'shroud', dx:-2.0, dy:-30.0, r:1.5, zo:4.31, mesh:true},
+      {name:'shroud', dx:-2.0, dy:-32.0, r:1.5, zo:5.13, mesh:true},
+      {name:'shroud', dx:-2.0, dy:-34.0, r:1.5, zo:5.83, mesh:true},
+      {name:'shroud', dx:-2.0, dy:-36.0, r:1.5, zo:6.66, mesh:true},
+      {name:'shroud', dx:-2.0, dy:-38.0, r:1.5, zo:7.53, mesh:true},
+      {name:'shroud', dx:-2.0, dy:-40.0, r:1.5, zo:8.21, mesh:true},
+      {name:'shroud', dx:-2.0, dy:-42.0, r:1.5, zo:8.97, mesh:true},
+      {name:'shroud', dx:0.0, dy:18.0, r:1.5, zo:8.83, mesh:true},
+      {name:'shroud', dx:0.0, dy:16.0, r:1.5, zo:7.71, mesh:true},
+      {name:'shroud', dx:0.0, dy:14.0, r:1.5, zo:7.00, mesh:true},
+      {name:'shroud', dx:0.0, dy:12.0, r:1.5, zo:6.09, mesh:true},
+      {name:'shroud', dx:0.0, dy:10.0, r:1.5, zo:5.41, mesh:true},
+      {name:'shroud', dx:0.0, dy:8.0, r:1.5, zo:4.67, mesh:true},
+      {name:'shroud', dx:0.0, dy:6.0, r:1.5, zo:3.96, mesh:true},
+      {name:'shroud', dx:0.0, dy:4.0, r:1.5, zo:3.60, mesh:true},
+      {name:'cone', dx:0.0, dy:-6.0, r:1.5, zo:4.53, mesh:true},
+      {name:'cone', dx:0.0, dy:-8.0, r:1.5, zo:2.03, mesh:true},
+      {name:'cone', dx:0.0, dy:-10.0, r:1.5, zo:0.03, mesh:true},
+      {name:'cone', dx:0.0, dy:-12.0, r:1.5, zo:0.03, mesh:true},
+      {name:'cone', dx:0.0, dy:-14.0, r:1.5, zo:2.03, mesh:true},
+      {name:'cone', dx:0.0, dy:-16.0, r:1.5, zo:4.53, mesh:true},
+      {name:'cone', dx:0.0, dy:-18.0, r:1.5, zo:5.40, mesh:true},
+      {name:'shroud', dx:0.0, dy:-30.0, r:1.5, zo:4.43, mesh:true},
+      {name:'shroud', dx:0.0, dy:-32.0, r:1.5, zo:4.66, mesh:true},
+      {name:'shroud', dx:0.0, dy:-34.0, r:1.5, zo:5.87, mesh:true},
+      {name:'shroud', dx:0.0, dy:-36.0, r:1.5, zo:6.74, mesh:true},
+      {name:'shroud', dx:0.0, dy:-38.0, r:1.5, zo:7.29, mesh:true},
+      {name:'shroud', dx:0.0, dy:-40.0, r:1.5, zo:8.06, mesh:true},
+      {name:'shroud', dx:0.0, dy:-42.0, r:1.5, zo:8.66, mesh:true},
+      {name:'shroud', dx:2.0, dy:18.0, r:1.5, zo:8.56, mesh:true},
+      {name:'shroud', dx:2.0, dy:16.0, r:1.5, zo:7.68, mesh:true},
+      {name:'shroud', dx:2.0, dy:14.0, r:1.5, zo:6.82, mesh:true},
+      {name:'shroud', dx:2.0, dy:12.0, r:1.5, zo:6.10, mesh:true},
+      {name:'shroud', dx:2.0, dy:10.0, r:1.5, zo:5.47, mesh:true},
+      {name:'shroud', dx:2.0, dy:8.0, r:1.5, zo:4.30, mesh:true},
+      {name:'shroud', dx:2.0, dy:6.0, r:1.5, zo:3.64, mesh:true},
+      {name:'shroud', dx:2.0, dy:4.0, r:1.5, zo:3.42, mesh:true},
+      {name:'cone', dx:2.0, dy:-6.0, r:1.5, zo:4.53, mesh:true},
+      {name:'cone', dx:2.0, dy:-8.0, r:1.5, zo:2.03, mesh:true},
+      {name:'cone', dx:2.0, dy:-10.0, r:1.5, zo:2.01, mesh:true},
+      {name:'cone', dx:2.0, dy:-12.0, r:1.5, zo:2.01, mesh:true},
+      {name:'cone', dx:2.0, dy:-14.0, r:1.5, zo:2.03, mesh:true},
+      {name:'cone', dx:2.0, dy:-16.0, r:1.5, zo:4.53, mesh:true},
+      {name:'cone', dx:2.0, dy:-18.0, r:1.5, zo:5.40, mesh:true},
+      {name:'shroud', dx:2.0, dy:-26.0, r:1.5, zo:6.65, mesh:true},
+      {name:'shroud', dx:2.0, dy:-28.0, r:1.5, zo:3.42, mesh:true},
+      {name:'shroud', dx:2.0, dy:-30.0, r:1.5, zo:4.14, mesh:true},
+      {name:'shroud', dx:2.0, dy:-32.0, r:1.5, zo:4.66, mesh:true},
+      {name:'shroud', dx:2.0, dy:-34.0, r:1.5, zo:5.92, mesh:true},
+      {name:'shroud', dx:2.0, dy:-36.0, r:1.5, zo:6.51, mesh:true},
+      {name:'shroud', dx:2.0, dy:-38.0, r:1.5, zo:7.22, mesh:true},
+      {name:'shroud', dx:2.0, dy:-40.0, r:1.5, zo:7.92, mesh:true},
+      {name:'shroud', dx:2.0, dy:-42.0, r:1.5, zo:8.55, mesh:true},
+      {name:'shroud', dx:4.0, dy:18.0, r:1.5, zo:8.43, mesh:true},
+      {name:'shroud', dx:4.0, dy:16.0, r:1.5, zo:7.81, mesh:true},
+      {name:'shroud', dx:4.0, dy:14.0, r:1.5, zo:7.02, mesh:true},
+      {name:'shroud', dx:4.0, dy:12.0, r:1.5, zo:6.22, mesh:true},
+      {name:'shroud', dx:4.0, dy:10.0, r:1.5, zo:5.42, mesh:true},
+      {name:'shroud', dx:4.0, dy:8.0, r:1.5, zo:4.74, mesh:true},
+      {name:'shroud', dx:4.0, dy:6.0, r:1.5, zo:7.59, mesh:true},
+      {name:'shroud', dx:4.0, dy:2.0, r:1.5, zo:3.17, mesh:true},
+      {name:'cone', dx:4.0, dy:-6.0, r:1.5, zo:4.53, mesh:true},
+      {name:'cone', dx:4.0, dy:-8.0, r:1.5, zo:4.53, mesh:true},
+      {name:'cone', dx:4.0, dy:-10.0, r:1.5, zo:2.03, mesh:true},
+      {name:'cone', dx:4.0, dy:-12.0, r:1.5, zo:2.03, mesh:true},
+      {name:'cone', dx:4.0, dy:-14.0, r:1.5, zo:2.03, mesh:true},
+      {name:'cone', dx:4.0, dy:-16.0, r:1.5, zo:4.53, mesh:true},
+      {name:'cone', dx:4.0, dy:-18.0, r:1.5, zo:5.40, mesh:true},
+      {name:'shroud', dx:4.0, dy:-24.0, r:1.5, zo:6.02, mesh:true},
+      {name:'shroud', dx:4.0, dy:-26.0, r:1.5, zo:3.17, mesh:true},
+      {name:'shroud', dx:4.0, dy:-30.0, r:1.5, zo:4.74, mesh:true},
+      {name:'shroud', dx:4.0, dy:-32.0, r:1.5, zo:5.10, mesh:true},
+      {name:'shroud', dx:4.0, dy:-34.0, r:1.5, zo:5.78, mesh:true},
+      {name:'shroud', dx:4.0, dy:-36.0, r:1.5, zo:6.47, mesh:true},
+      {name:'shroud', dx:4.0, dy:-38.0, r:1.5, zo:7.15, mesh:true},
+      {name:'shroud', dx:4.0, dy:-40.0, r:1.5, zo:7.78, mesh:true},
+      {name:'shroud', dx:6.0, dy:16.0, r:1.5, zo:7.60, mesh:true},
+      {name:'shroud', dx:6.0, dy:14.0, r:1.5, zo:6.80, mesh:true},
+      {name:'shroud', dx:6.0, dy:12.0, r:1.5, zo:6.12, mesh:true},
+      {name:'shroud', dx:6.0, dy:10.0, r:1.5, zo:5.40, mesh:true},
+      {name:'shroud', dx:6.0, dy:8.0, r:1.5, zo:4.96, mesh:true},
+      {name:'shroud', dx:6.0, dy:6.0, r:1.5, zo:7.59, mesh:true},
+      {name:'cone', dx:6.0, dy:-8.0, r:1.5, zo:4.53, mesh:true},
+      {name:'cone', dx:6.0, dy:-10.0, r:1.5, zo:4.53, mesh:true},
+      {name:'cone', dx:6.0, dy:-12.0, r:1.5, zo:4.53, mesh:true},
+      {name:'cone', dx:6.0, dy:-14.0, r:1.5, zo:4.53, mesh:true},
+      {name:'cone', dx:6.0, dy:-16.0, r:1.5, zo:5.40, mesh:true},
+      {name:'shroud', dx:6.0, dy:-30.0, r:1.5, zo:4.74, mesh:true},
+      {name:'shroud', dx:6.0, dy:-32.0, r:1.5, zo:5.28, mesh:true},
+      {name:'shroud', dx:6.0, dy:-34.0, r:1.5, zo:5.81, mesh:true},
+      {name:'shroud', dx:6.0, dy:-36.0, r:1.5, zo:6.52, mesh:true},
+      {name:'shroud', dx:6.0, dy:-38.0, r:1.5, zo:7.06, mesh:true},
+      {name:'shroud', dx:8.0, dy:14.0, r:1.5, zo:6.90, mesh:true},
+      {name:'shroud', dx:8.0, dy:12.0, r:1.5, zo:6.18, mesh:true},
+      {name:'shroud', dx:8.0, dy:10.0, r:1.5, zo:5.62, mesh:true},
+      {name:'shroud', dx:8.0, dy:8.0, r:1.5, zo:5.04, mesh:true},
+      {name:'shroud', dx:8.0, dy:-30.0, r:1.5, zo:5.03, mesh:true},
+      {name:'shroud', dx:8.0, dy:-32.0, r:1.5, zo:5.32, mesh:true},
+      {name:'shroud', dx:8.0, dy:-34.0, r:1.5, zo:5.74, mesh:true},
+      {name:'shroud', dx:8.0, dy:-36.0, r:1.5, zo:6.40, mesh:true},
+      {name:'shroud', dx:10.0, dy:14.0, r:1.5, zo:6.08, mesh:true},
+      {name:'shroud', dx:10.0, dy:10.0, r:1.5, zo:5.46, mesh:true},
+      {name:'shroud', dx:10.0, dy:8.0, r:1.5, zo:4.74, mesh:true},
+      {name:'shroud', dx:10.0, dy:6.0, r:1.5, zo:7.59, mesh:true},
+      {name:'shroud', dx:10.0, dy:2.0, r:1.5, zo:2.22, mesh:true},
+      {name:'shroud', dx:10.0, dy:-24.0, r:1.5, zo:6.02, mesh:true},
+      {name:'shroud', dx:10.0, dy:-26.0, r:1.5, zo:2.22, mesh:true},
+      {name:'shroud', dx:10.0, dy:-30.0, r:1.5, zo:4.74, mesh:true},
+      {name:'shroud', dx:10.0, dy:-32.0, r:1.5, zo:5.12, mesh:true},
+      {name:'shroud', dx:10.0, dy:-36.0, r:1.5, zo:5.88, mesh:true},
+];
+const MESH_CELLS_R = [
+      {name:'shroud', dx:-10.0, dy:14.0, r:1.5, zo:6.11, mesh:true},
+      {name:'shroud', dx:-10.0, dy:2.0, r:1.5, zo:2.25, mesh:true},
+      {name:'shroud', dx:-10.0, dy:-24.0, r:1.5, zo:7.00, mesh:true},
+      {name:'shroud', dx:-10.0, dy:-26.0, r:1.5, zo:2.25, mesh:true},
+      {name:'shroud', dx:-10.0, dy:-36.0, r:1.5, zo:5.91, mesh:true},
+      {name:'shroud', dx:-8.0, dy:14.0, r:1.5, zo:6.92, mesh:true},
+      {name:'shroud', dx:-8.0, dy:12.0, r:1.5, zo:6.20, mesh:true},
+      {name:'shroud', dx:-8.0, dy:10.0, r:1.5, zo:5.48, mesh:true},
+      {name:'shroud', dx:-8.0, dy:8.0, r:1.5, zo:4.76, mesh:true},
+      {name:'shroud', dx:-8.0, dy:6.0, r:1.5, zo:7.61, mesh:true},
+      {name:'shroud', dx:-8.0, dy:2.0, r:1.5, zo:3.20, mesh:true},
+      {name:'shroud', dx:-8.0, dy:-24.0, r:1.5, zo:6.05, mesh:true},
+      {name:'shroud', dx:-8.0, dy:-26.0, r:1.5, zo:3.20, mesh:true},
+      {name:'shroud', dx:-8.0, dy:-30.0, r:1.5, zo:4.76, mesh:true},
+      {name:'shroud', dx:-8.0, dy:-32.0, r:1.5, zo:5.15, mesh:true},
+      {name:'shroud', dx:-8.0, dy:-34.0, r:1.5, zo:5.76, mesh:true},
+      {name:'shroud', dx:-8.0, dy:-36.0, r:1.5, zo:6.42, mesh:true},
+      {name:'shroud', dx:-6.0, dy:16.0, r:1.5, zo:7.62, mesh:true},
+      {name:'shroud', dx:-6.0, dy:14.0, r:1.5, zo:6.98, mesh:true},
+      {name:'shroud', dx:-6.0, dy:12.0, r:1.5, zo:6.15, mesh:true},
+      {name:'shroud', dx:-6.0, dy:10.0, r:1.5, zo:5.43, mesh:true},
+      {name:'shroud', dx:-6.0, dy:8.0, r:1.5, zo:4.99, mesh:true},
+      {name:'cone', dx:-6.0, dy:-8.0, r:1.5, zo:5.40, mesh:true},
+      {name:'cone', dx:-6.0, dy:-10.0, r:1.5, zo:4.53, mesh:true},
+      {name:'cone', dx:-6.0, dy:-12.0, r:1.5, zo:4.53, mesh:true},
+      {name:'cone', dx:-6.0, dy:-14.0, r:1.5, zo:5.40, mesh:true},
+      {name:'shroud', dx:-6.0, dy:-30.0, r:1.5, zo:4.76, mesh:true},
+      {name:'shroud', dx:-6.0, dy:-32.0, r:1.5, zo:5.32, mesh:true},
+      {name:'shroud', dx:-6.0, dy:-34.0, r:1.5, zo:5.84, mesh:true},
+      {name:'shroud', dx:-6.0, dy:-36.0, r:1.5, zo:6.59, mesh:true},
+      {name:'shroud', dx:-6.0, dy:-38.0, r:1.5, zo:7.08, mesh:true},
+      {name:'shroud', dx:-4.0, dy:18.0, r:1.5, zo:8.46, mesh:true},
+      {name:'shroud', dx:-4.0, dy:16.0, r:1.5, zo:7.72, mesh:true},
+      {name:'shroud', dx:-4.0, dy:14.0, r:1.5, zo:6.83, mesh:true},
+      {name:'shroud', dx:-4.0, dy:12.0, r:1.5, zo:6.34, mesh:true},
+      {name:'shroud', dx:-4.0, dy:10.0, r:1.5, zo:5.50, mesh:true},
+      {name:'shroud', dx:-4.0, dy:8.0, r:1.5, zo:4.76, mesh:true},
+      {name:'shroud', dx:-4.0, dy:6.0, r:1.5, zo:7.61, mesh:true},
+      {name:'shroud', dx:-4.0, dy:2.0, r:1.5, zo:3.20, mesh:true},
+      {name:'cone', dx:-4.0, dy:-6.0, r:1.5, zo:5.40, mesh:true},
+      {name:'cone', dx:-4.0, dy:-8.0, r:1.5, zo:4.53, mesh:true},
+      {name:'cone', dx:-4.0, dy:-10.0, r:1.5, zo:2.03, mesh:true},
+      {name:'cone', dx:-4.0, dy:-12.0, r:1.5, zo:2.03, mesh:true},
+      {name:'cone', dx:-4.0, dy:-14.0, r:1.5, zo:4.53, mesh:true},
+      {name:'cone', dx:-4.0, dy:-16.0, r:1.5, zo:4.53, mesh:true},
+      {name:'shroud', dx:-4.0, dy:-24.0, r:1.5, zo:6.05, mesh:true},
+      {name:'shroud', dx:-4.0, dy:-26.0, r:1.5, zo:3.20, mesh:true},
+      {name:'shroud', dx:-4.0, dy:-30.0, r:1.5, zo:4.76, mesh:true},
+      {name:'shroud', dx:-4.0, dy:-32.0, r:1.5, zo:5.13, mesh:true},
+      {name:'shroud', dx:-4.0, dy:-34.0, r:1.5, zo:5.81, mesh:true},
+      {name:'shroud', dx:-4.0, dy:-36.0, r:1.5, zo:6.50, mesh:true},
+      {name:'shroud', dx:-4.0, dy:-38.0, r:1.5, zo:7.17, mesh:true},
+      {name:'shroud', dx:-4.0, dy:-40.0, r:1.5, zo:7.80, mesh:true},
+      {name:'shroud', dx:-2.0, dy:18.0, r:1.5, zo:8.59, mesh:true},
+      {name:'shroud', dx:-2.0, dy:16.0, r:1.5, zo:7.71, mesh:true},
+      {name:'shroud', dx:-2.0, dy:14.0, r:1.5, zo:6.84, mesh:true},
+      {name:'shroud', dx:-2.0, dy:12.0, r:1.5, zo:6.13, mesh:true},
+      {name:'shroud', dx:-2.0, dy:10.0, r:1.5, zo:5.44, mesh:true},
+      {name:'shroud', dx:-2.0, dy:8.0, r:1.5, zo:4.71, mesh:true},
+      {name:'shroud', dx:-2.0, dy:6.0, r:1.5, zo:7.61, mesh:true},
+      {name:'shroud', dx:-2.0, dy:4.0, r:1.5, zo:3.63, mesh:true},
+      {name:'shroud', dx:-2.0, dy:2.0, r:1.5, zo:3.20, mesh:true},
+      {name:'cone', dx:-2.0, dy:-6.0, r:1.5, zo:4.53, mesh:true},
+      {name:'cone', dx:-2.0, dy:-8.0, r:1.5, zo:2.03, mesh:true},
+      {name:'cone', dx:-2.0, dy:-10.0, r:1.5, zo:2.03, mesh:true},
+      {name:'cone', dx:-2.0, dy:-12.0, r:1.5, zo:2.03, mesh:true},
+      {name:'cone', dx:-2.0, dy:-14.0, r:1.5, zo:2.03, mesh:true},
+      {name:'cone', dx:-2.0, dy:-16.0, r:1.5, zo:4.53, mesh:true},
+      {name:'cone', dx:-2.0, dy:-18.0, r:1.5, zo:5.40, mesh:true},
+      {name:'shroud', dx:-2.0, dy:-24.0, r:1.5, zo:6.05, mesh:true},
+      {name:'shroud', dx:-2.0, dy:-26.0, r:1.5, zo:3.20, mesh:true},
+      {name:'shroud', dx:-2.0, dy:-28.0, r:1.5, zo:3.68, mesh:true},
+      {name:'shroud', dx:-2.0, dy:-30.0, r:1.5, zo:4.53, mesh:true},
+      {name:'shroud', dx:-2.0, dy:-32.0, r:1.5, zo:5.27, mesh:true},
+      {name:'shroud', dx:-2.0, dy:-34.0, r:1.5, zo:5.94, mesh:true},
+      {name:'shroud', dx:-2.0, dy:-36.0, r:1.5, zo:6.53, mesh:true},
+      {name:'shroud', dx:-2.0, dy:-38.0, r:1.5, zo:7.24, mesh:true},
+      {name:'shroud', dx:-2.0, dy:-40.0, r:1.5, zo:7.94, mesh:true},
+      {name:'shroud', dx:-2.0, dy:-42.0, r:1.5, zo:8.57, mesh:true},
+      {name:'shroud', dx:0.0, dy:18.0, r:1.5, zo:8.72, mesh:true},
+      {name:'shroud', dx:0.0, dy:16.0, r:1.5, zo:7.67, mesh:true},
+      {name:'shroud', dx:0.0, dy:14.0, r:1.5, zo:7.02, mesh:true},
+      {name:'shroud', dx:0.0, dy:12.0, r:1.5, zo:6.12, mesh:true},
+      {name:'shroud', dx:0.0, dy:10.0, r:1.5, zo:5.47, mesh:true},
+      {name:'shroud', dx:0.0, dy:8.0, r:1.5, zo:4.71, mesh:true},
+      {name:'shroud', dx:0.0, dy:6.0, r:1.5, zo:7.61, mesh:true},
+      {name:'shroud', dx:0.0, dy:4.0, r:1.5, zo:3.63, mesh:true},
+      {name:'cone', dx:0.0, dy:-6.0, r:1.5, zo:4.53, mesh:true},
+      {name:'cone', dx:0.0, dy:-8.0, r:1.5, zo:2.03, mesh:true},
+      {name:'cone', dx:0.0, dy:-10.0, r:1.5, zo:0.03, mesh:true},
+      {name:'cone', dx:0.0, dy:-12.0, r:1.5, zo:0.03, mesh:true},
+      {name:'cone', dx:0.0, dy:-14.0, r:1.5, zo:2.03, mesh:true},
+      {name:'cone', dx:0.0, dy:-16.0, r:1.5, zo:4.53, mesh:true},
+      {name:'cone', dx:0.0, dy:-18.0, r:1.5, zo:5.40, mesh:true},
+      {name:'shroud', dx:0.0, dy:-28.0, r:1.5, zo:3.63, mesh:true},
+      {name:'shroud', dx:0.0, dy:-30.0, r:1.5, zo:4.64, mesh:true},
+      {name:'shroud', dx:0.0, dy:-32.0, r:1.5, zo:5.24, mesh:true},
+      {name:'shroud', dx:0.0, dy:-34.0, r:1.5, zo:5.91, mesh:true},
+      {name:'shroud', dx:0.0, dy:-36.0, r:1.5, zo:6.61, mesh:true},
+      {name:'shroud', dx:0.0, dy:-38.0, r:1.5, zo:7.32, mesh:true},
+      {name:'shroud', dx:0.0, dy:-40.0, r:1.5, zo:8.08, mesh:true},
+      {name:'shroud', dx:0.0, dy:-42.0, r:1.5, zo:8.68, mesh:true},
+      {name:'shroud', dx:2.0, dy:18.0, r:1.5, zo:8.86, mesh:true},
+      {name:'shroud', dx:2.0, dy:16.0, r:1.5, zo:7.81, mesh:true},
+      {name:'shroud', dx:2.0, dy:14.0, r:1.5, zo:6.92, mesh:true},
+      {name:'shroud', dx:2.0, dy:12.0, r:1.5, zo:6.20, mesh:true},
+      {name:'shroud', dx:2.0, dy:10.0, r:1.5, zo:5.44, mesh:true},
+      {name:'shroud', dx:2.0, dy:8.0, r:1.5, zo:4.53, mesh:true},
+      {name:'shroud', dx:2.0, dy:6.0, r:1.5, zo:3.88, mesh:true},
+      {name:'shroud', dx:2.0, dy:4.0, r:1.5, zo:3.64, mesh:true},
+      {name:'cone', dx:2.0, dy:-6.0, r:1.5, zo:4.53, mesh:true},
+      {name:'cone', dx:2.0, dy:-8.0, r:1.5, zo:2.03, mesh:true},
+      {name:'cone', dx:2.0, dy:-10.0, r:1.5, zo:2.01, mesh:true},
+      {name:'cone', dx:2.0, dy:-12.0, r:1.5, zo:2.01, mesh:true},
+      {name:'cone', dx:2.0, dy:-14.0, r:1.5, zo:2.03, mesh:true},
+      {name:'cone', dx:2.0, dy:-16.0, r:1.5, zo:4.53, mesh:true},
+      {name:'cone', dx:2.0, dy:-18.0, r:1.5, zo:5.40, mesh:true},
+      {name:'shroud', dx:2.0, dy:-28.0, r:1.5, zo:3.63, mesh:true},
+      {name:'shroud', dx:2.0, dy:-30.0, r:1.5, zo:4.26, mesh:true},
+      {name:'shroud', dx:2.0, dy:-32.0, r:1.5, zo:5.21, mesh:true},
+      {name:'shroud', dx:2.0, dy:-34.0, r:1.5, zo:5.86, mesh:true},
+      {name:'shroud', dx:2.0, dy:-36.0, r:1.5, zo:6.72, mesh:true},
+      {name:'shroud', dx:2.0, dy:-38.0, r:1.5, zo:7.41, mesh:true},
+      {name:'shroud', dx:2.0, dy:-40.0, r:1.5, zo:8.23, mesh:true},
+      {name:'shroud', dx:2.0, dy:-42.0, r:1.5, zo:8.99, mesh:true},
+      {name:'shroud', dx:4.0, dy:18.0, r:1.5, zo:8.82, mesh:true},
+      {name:'shroud', dx:4.0, dy:16.0, r:1.5, zo:7.86, mesh:true},
+      {name:'shroud', dx:4.0, dy:14.0, r:1.5, zo:7.01, mesh:true},
+      {name:'shroud', dx:4.0, dy:12.0, r:1.5, zo:6.14, mesh:true},
+      {name:'shroud', dx:4.0, dy:10.0, r:1.5, zo:5.44, mesh:true},
+      {name:'shroud', dx:4.0, dy:8.0, r:1.5, zo:4.76, mesh:true},
+      {name:'shroud', dx:4.0, dy:6.0, r:1.5, zo:7.61, mesh:true},
+      {name:'shroud', dx:4.0, dy:2.0, r:1.5, zo:3.20, mesh:true},
+      {name:'cone', dx:4.0, dy:-6.0, r:1.5, zo:4.53, mesh:true},
+      {name:'cone', dx:4.0, dy:-8.0, r:1.5, zo:4.53, mesh:true},
+      {name:'cone', dx:4.0, dy:-10.0, r:1.5, zo:2.03, mesh:true},
+      {name:'cone', dx:4.0, dy:-12.0, r:1.5, zo:2.03, mesh:true},
+      {name:'cone', dx:4.0, dy:-14.0, r:1.5, zo:2.03, mesh:true},
+      {name:'cone', dx:4.0, dy:-16.0, r:1.5, zo:4.53, mesh:true},
+      {name:'cone', dx:4.0, dy:-18.0, r:1.5, zo:5.40, mesh:true},
+      {name:'shroud', dx:4.0, dy:-24.0, r:1.5, zo:6.05, mesh:true},
+      {name:'shroud', dx:4.0, dy:-26.0, r:1.5, zo:3.20, mesh:true},
+      {name:'shroud', dx:4.0, dy:-30.0, r:1.5, zo:4.76, mesh:true},
+      {name:'shroud', dx:4.0, dy:-32.0, r:1.5, zo:5.13, mesh:true},
+      {name:'shroud', dx:4.0, dy:-34.0, r:1.5, zo:5.91, mesh:true},
+      {name:'shroud', dx:4.0, dy:-36.0, r:1.5, zo:6.69, mesh:true},
+      {name:'shroud', dx:4.0, dy:-38.0, r:1.5, zo:7.70, mesh:true},
+      {name:'shroud', dx:4.0, dy:-40.0, r:1.5, zo:8.55, mesh:true},
+      {name:'shroud', dx:6.0, dy:16.0, r:1.5, zo:8.14, mesh:true},
+      {name:'shroud', dx:6.0, dy:14.0, r:1.5, zo:7.11, mesh:true},
+      {name:'shroud', dx:6.0, dy:12.0, r:1.5, zo:6.20, mesh:true},
+      {name:'shroud', dx:6.0, dy:10.0, r:1.5, zo:5.45, mesh:true},
+      {name:'shroud', dx:6.0, dy:8.0, r:1.5, zo:4.91, mesh:true},
+      {name:'shroud', dx:6.0, dy:6.0, r:1.5, zo:7.61, mesh:true},
+      {name:'cone', dx:6.0, dy:-8.0, r:1.5, zo:4.53, mesh:true},
+      {name:'cone', dx:6.0, dy:-10.0, r:1.5, zo:4.53, mesh:true},
+      {name:'cone', dx:6.0, dy:-12.0, r:1.5, zo:4.53, mesh:true},
+      {name:'cone', dx:6.0, dy:-14.0, r:1.5, zo:4.53, mesh:true},
+      {name:'cone', dx:6.0, dy:-16.0, r:1.5, zo:5.40, mesh:true},
+      {name:'shroud', dx:6.0, dy:-30.0, r:1.5, zo:4.76, mesh:true},
+      {name:'shroud', dx:6.0, dy:-32.0, r:1.5, zo:5.16, mesh:true},
+      {name:'shroud', dx:6.0, dy:-34.0, r:1.5, zo:5.95, mesh:true},
+      {name:'shroud', dx:6.0, dy:-36.0, r:1.5, zo:6.79, mesh:true},
+      {name:'shroud', dx:6.0, dy:-38.0, r:1.5, zo:7.86, mesh:true},
+      {name:'shroud', dx:6.0, dy:-40.0, r:1.5, zo:8.89, mesh:true},
+      {name:'shroud', dx:8.0, dy:16.0, r:1.5, zo:8.22, mesh:true},
+      {name:'shroud', dx:8.0, dy:14.0, r:1.5, zo:7.14, mesh:true},
+      {name:'shroud', dx:8.0, dy:12.0, r:1.5, zo:6.19, mesh:true},
+      {name:'shroud', dx:8.0, dy:10.0, r:1.5, zo:5.43, mesh:true},
+      {name:'shroud', dx:8.0, dy:8.0, r:1.5, zo:4.94, mesh:true},
+      {name:'shroud', dx:8.0, dy:6.0, r:1.5, zo:7.61, mesh:true},
+      {name:'shroud', dx:8.0, dy:-30.0, r:1.5, zo:4.95, mesh:true},
+      {name:'shroud', dx:8.0, dy:-32.0, r:1.5, zo:5.13, mesh:true},
+      {name:'shroud', dx:8.0, dy:-34.0, r:1.5, zo:6.08, mesh:true},
+      {name:'shroud', dx:8.0, dy:-36.0, r:1.5, zo:7.10, mesh:true},
+      {name:'shroud', dx:8.0, dy:-38.0, r:1.5, zo:8.21, mesh:true},
+      {name:'shroud', dx:10.0, dy:16.0, r:1.5, zo:8.51, mesh:true},
+      {name:'shroud', dx:10.0, dy:14.0, r:1.5, zo:7.21, mesh:true},
+      {name:'shroud', dx:10.0, dy:12.0, r:1.5, zo:6.35, mesh:true},
+      {name:'shroud', dx:10.0, dy:10.0, r:1.5, zo:5.53, mesh:true},
+      {name:'shroud', dx:10.0, dy:8.0, r:1.5, zo:4.76, mesh:true},
+      {name:'shroud', dx:10.0, dy:6.0, r:1.5, zo:6.63, mesh:true},
+      {name:'shroud', dx:10.0, dy:2.0, r:1.5, zo:2.25, mesh:true},
+      {name:'shroud', dx:10.0, dy:-24.0, r:1.5, zo:6.05, mesh:true},
+      {name:'shroud', dx:10.0, dy:-26.0, r:1.5, zo:2.25, mesh:true},
+      {name:'shroud', dx:10.0, dy:-30.0, r:1.5, zo:4.76, mesh:true},
+      {name:'shroud', dx:10.0, dy:-32.0, r:1.5, zo:5.15, mesh:true},
+      {name:'shroud', dx:10.0, dy:-34.0, r:1.5, zo:6.04, mesh:true},
+      {name:'shroud', dx:10.0, dy:-36.0, r:1.5, zo:7.26, mesh:true},
+      {name:'shroud', dx:10.0, dy:-38.0, r:1.5, zo:8.78, mesh:true},
+      {name:'shroud', dx:12.0, dy:16.0, r:1.5, zo:8.75, mesh:true},
+      {name:'shroud', dx:12.0, dy:14.0, r:1.5, zo:7.52, mesh:true},
+      {name:'shroud', dx:12.0, dy:12.0, r:1.5, zo:6.56, mesh:true},
+      {name:'shroud', dx:12.0, dy:10.0, r:1.5, zo:8.29, mesh:true},
+      {name:'shroud', dx:12.0, dy:-34.0, r:1.5, zo:7.10, mesh:true},
+      {name:'shroud', dx:12.0, dy:-36.0, r:1.5, zo:7.57, mesh:true},
+      {name:'shroud', dx:14.0, dy:14.0, r:1.5, zo:7.92, mesh:true},
+      {name:'shroud', dx:14.0, dy:12.0, r:1.5, zo:7.50, mesh:true},
+      {name:'shroud', dx:14.0, dy:-36.0, r:1.5, zo:8.62, mesh:true},
+      {name:'shroud', dx:16.0, dy:14.0, r:1.5, zo:8.26, mesh:true},
+      {name:'shroud', dx:16.0, dy:10.0, r:1.5, zo:8.63, mesh:true},
+      {name:'shroud', dx:18.0, dy:14.0, r:1.5, zo:8.99, mesh:true},
+      {name:'shroud', dx:20.0, dy:10.0, r:1.5, zo:4.59, mesh:true},
+      {name:'shroud', dx:20.0, dy:-38.0, r:1.5, zo:6.19, mesh:true},
+];
+let elsCache = {};
 function els(headB) {
+  const pin = document.getElementById('pin');
+  const ck = (headB ? 'B' : 'A') + (pin && pin.checked ? 'p' : '');
+  if (elsCache[ck]) return elsCache[ck];
   const d = headB ? geo.bl : 0;
   if (HEADS === 'vostok') {
-    // All discs MEASURED from the actual STL meshes (parsed + the loader
-    // transform + the corrected manifest): tip cone at the origin, cone
-    // widening to r4.2 by +2.5mm, heater block r6.6 from +5mm. The L cool
-    // duct tip REALLY hangs 1.7mm BELOW the nozzle at dx -26.3; the R duct
-    // tip is at (+10.2, +14.2) at +2.25mm; shroud rims run along dy +-13..14.
+    // base discs measured from the STLs: tip cone r0.7 at 0, heater cone
+    // r4.2 from +2.5, block r6.6 from +5 - plus the mesh cell set above
     const e0 = [
-      {name:'nozzle', dx:0, dy:0, r:0.7, zo:0},          // STL tip cone
-      {name:'sock', dx:0, dy:0, r:4.2, zo:2.5 + d},      // cone -> heater
-      {name:'block', dx:0, dy:0, r:6.6, zo:5 + d},       // heater block
+      {name:'nozzle', dx:0, dy:0, r:0.7, zo:0},
+      {name:'sock', dx:0, dy:0, r:4.2, zo:2.5 + d},
+      {name:'block', dx:0, dy:0, r:6.6, zo:5 + d},
     ];
-    if (headB) e0.push(
-      {name:'duct R', dx:10.2, dy:14.2, r:2.5, zo:2.25 + d},
-      {name:'shroud R front', dx:0, dy:13, r:4, zo:3.2 + d},
-      {name:'shroud R rear', dx:0, dy:-13, r:4, zo:3.2 + d});
-    else e0.push(
-      {name:'duct L', dx:-26.3, dy:0, r:2.5, zo:-1.7},   // BELOW the tip!
-      {name:'shroud L front', dx:0, dy:14.2, r:5, zo:3.2 + d},
-      {name:'shroud L rear', dx:0, dy:-14.2, r:5, zo:3.2 + d});
     // BLTouch: during calibration its pin is RETRACTED, so the nozzle stays
     // the lowest point; only the body matters - beside the nozzle, above the tip
     e0.push({name:'bltouch body', dx:-24, dy:-6, r:3, zo:9 + d});
-    const pin = document.getElementById('pin');
     if (!headB && pin && pin.checked)
       e0.push({name:'pin', dx:-6, dy:4, r:0.6, zo: PIN_ZP + d});
-    return e0;
+    for (const c of headB ? MESH_CELLS_R : MESH_CELLS_L) e0.push(c);
+    return elsCache[ck] = e0;
   }
   const e = [
     {name:'nozzle', dx:0, dy:0, r:0.4, zo:0},
@@ -181,9 +604,8 @@ function els(headB) {
     {name:'duct L', dx:-geo.dd, dy:0, r:4, zo:geo.zd + d},
     {name:'duct R', dx:+geo.dd, dy:0, r:4, zo:geo.zd + d},
   ];
-  const pin = document.getElementById('pin');
   if (!headB && pin && pin.checked) e.push({name:'pin', dx:-6, dy:4, r:0.6, zo:geo.zp});
-  return e;
+  return elsCache[ck] = e;
 }
 // =====================================================================
 //  The G-code executor is the single source of motion.
@@ -324,7 +746,7 @@ const M = {
         mark(w.x, w.y, 42, 0x884444);
         log(`✗ glitch (false click) at ${pos.x.toFixed(1)},${pos.y.toFixed(1)}`, 'bad');
       } else if (hit) {
-        res = {triggered: true, x: pos.x, y: pos.y, z: hit.z, el: hit.el};
+        res = {triggered: true, x: pos.x, y: pos.y, z: hit.z, el: hit.el, dx: hit.dx || 0, dy: hit.dy || 0};
         this.clicks++;
         const good = hit.el === 'nozzle';
         if (!good) this.bad++;
@@ -335,7 +757,7 @@ const M = {
       } else res = {triggered: false, x: pos.x, y: pos.y, z: c.fz};
       // real click: lever pre-travel (Z trigger lag) + X/Y slop
       if (res.triggered && res.el !== 'glitch') {
-        res = {triggered: true, el: res.el,
+        res = {triggered: true, el: res.el, dx: res.dx, dy: res.dy,
           x: pos.x + (rng()-0.5)*2*this.jit,
           y: pos.y + (rng()-0.5)*2*this.jit,
           z: res.z - this.pre};
@@ -573,16 +995,35 @@ function* algoSphere() {
           climbClicks++;
           if (r && r.triggered && r.el !== 'glitch') {
             samples().push({x:r.x, y:r.y, z:r.z, el:r.el}); updBest(r);
-            // early exit: a nozzle point is always on the sphere; clearly higher is an escape too
-            if (r.el === 'nozzle' || r.z > cur.z + 0.3) escaped = r;
+            if (r.el === 'nozzle') escaped = r;
+            // a FOREIGN click rising above cur can mean two things: nearing
+            // the ball (good) or still surfing the element's own dome (trap).
+            // Disambiguate immediately: put the nozzle where THAT element
+            // touched - if the nozzle clicks there, we are on the ball and
+            // that click is the true escape; otherwise keep ring-scanning
+            // instead of chasing the foreign dome uphill.
+            else if (r.z > cur.z + 0.3 && (r.dx !== undefined || r.dy !== undefined)) {
+              const j = yield* press(clx(r.x + (r.dx || 0)), cly(r.y + (r.dy || 0)));
+              climbClicks++;
+              if (j && j.triggered && j.el === 'nozzle') {
+                samples().push({x:j.x, y:j.y, z:j.z, el:j.el}); updBest(j);
+                escaped = j;
+              } else if (j && j.triggered && j.el !== 'glitch') {
+                samples().push({x:j.x, y:j.y, z:j.z, el:j.el}); updBest(j);
+              }
+            }
           }
         }
       }
       if (escaped) { cur = escaped; d = 4; continue climb; }
       // jumps along element offsets (known head geometry); a hard budget
       // terminates any plateau wander (the vostok duct plateau is huge)
-      const offs2 = els(head === 'B').filter(e => e.dx !== 0 || e.dy !== 0)
+      const offs2 = els(head === 'B').filter(e => !e.mesh && (e.dx !== 0 || e.dy !== 0))
           .map(e => [e.dx, e.dy]);
+      // element-true jump first: the click happened where the clicked
+      // ELEMENT met the ball - put the nozzle exactly on that spot
+      if (cur.dx !== undefined || cur.dy !== undefined)
+        offs2.unshift([cur.dx || 0, cur.dy || 0]);
       let jumped = null;
       for (const [dx, dy] of offs2) {
         const r = yield* press(clx(cur.x+dx), cly(cur.y+dy));
@@ -789,7 +1230,7 @@ const VOSTOK_PARTS = {
   ],
 };
 const VOSTOK_TUBE = {file: 'vostok_x_tube.stl', len: 500, dy: 71.5, dz: -40.12}; // vs nozzle (y up, z front)
-const SIM_VER = 'v82';
+const SIM_VER = 'v83';
 const VBUST = Date.now() % 1000000;
 document.getElementById('hudver').textContent = SIM_VER + ' (green dot = a click the physics engine attributed to the NOZZLE disc at the head origin; if the mesh visibly disagrees, the STL placement is wrong - report it)';
 let vostokGeoms = null;
@@ -1428,7 +1869,12 @@ if (location.search.includes('test=grid') || location.search.includes('test=sing
           const tB = {x: ball.x - nB.x, y: ball.y - nB.y, z: BALL_CZ + BALL_R - nB.z};
           const axA = Math.max(Math.hypot(S.apexA.x-tA.x, S.apexA.y-tA.y), Math.abs(S.apexA.z-tA.z));
           const axB = Math.max(Math.hypot(S.apexB.x-tB.x, S.apexB.y-tB.y), Math.abs(S.apexB.z-tB.z));
-          const r = {pos:`(${p[0]},${p[1]})`, ok: !!(S.eoffErr && Math.abs(S.eoffErr.dx)<0.5 && Math.abs(S.eoffErr.dy)<0.5 && Math.abs(S.eoffErr.dz)<0.5 && M.ballMoves === 0 && !S.foreignApex && axA < 0.5 && axB < 0.5),
+          const r = {pos:`(${p[0]},${p[1]})`, // axA/axB gate: the apex record must be ON THE BALL in each head's frame.
+            // A foreign-element apex (the decoy pin) sits >=5mm off the top;
+            // with 3% readout noise + shroud-truncated rings the best nozzle
+            // click can sit ~1.5mm down the shoulder - still the ball, so
+            // the gate is 2.0mm, not sub-mm
+            ok: !!(S.eoffErr && Math.abs(S.eoffErr.dx)<0.5 && Math.abs(S.eoffErr.dy)<0.5 && Math.abs(S.eoffErr.dz)<0.5 && M.ballMoves === 0 && !S.foreignApex && axA < 2.0 && axB < 2.0),
             exy: S.eoffErr ? Math.hypot(S.eoffErr.dx, S.eoffErr.dy) : NaN,
             ez: S.eoffErr ? Math.abs(S.eoffErr.dz) : NaN,
             clicks: M.clicks, bad: M.bad, dist: M.dist, mv: M.ballMoves,
