@@ -54,6 +54,9 @@ class ToolOffsetSphere:
         # offsets of head parts that hang beside/below the nozzle and can
         # click first (vostok: the L cool duct at -26mm on A, +10,+14 on B)
         self.tap_hops_a = _hops('tap_hops_a', '-26,0')
+        import os
+        self._ballpos_path = os.path.join(
+            os.path.dirname(os.path.realpath(__file__)), '.ball-pos.json')
         self.tap_hops_b = _hops('tap_hops_b', '10,14')
         self.esc_offsets = []
         for tok in config.get('escape_offsets', '-15,0 15,0').split():
@@ -142,7 +145,17 @@ class ToolOffsetSphere:
         # arming the endstop mid-ring latches a false instant trigger
         # ("Probe triggered prior to movement"). Let it decay first.
         self._toolhead().dwell(0.4)
-        if self.mcu_endstop.query_endstop(self._toolhead().get_last_move_time()):
+        # wait for the lever to swing back after the previous click (the
+        # real ball switch returns slowly); only a stuck pin is an error
+        _th = self._toolhead()
+        _released = False
+        for _ in range(20):
+            _th.dwell(0.1)
+            if not self.mcu_endstop.query_endstop(
+                    _th.get_last_move_time()):
+                _released = True
+                break
+        if not _released:
             raise self.printer.command_error(
                 "ball probe reports TRIGGERED before the descent (pressed, "
                 "jammed or wrong polarity) - check the switch")
@@ -520,9 +533,20 @@ class ToolOffsetSphere:
             if abs(ey) > 1.5: ey = 0.
             cur = (cur[0] + ex, cur[1] + ey, cur[2])
         ap = self._tap_press(cur[0], cur[1], floor, travel, tag)
-        if ap:
-            return (cur[0], cur[1], ap[2])
-        return cur
+        apex = (cur[0], cur[1], ap[2]) if ap else cur
+        # The cap gates only the SEED; the climb can still drift onto a
+        # part beside the nozzle (the duct line reports ball_top + its
+        # hang-below). A final apex above the cap is a foreign-element
+        # convergence: hop the nozzle to where that part touched the ball
+        # and measure again (one hop level deep, no loops).
+        if apex[2] > cap and hops:
+            for (hx, hy) in hops:
+                retry = self._tap_measure(apex[0] + hx, apex[1] + hy,
+                                          4, 2, dips, ball_top, [],
+                                          tag + 'hop')
+                if retry and retry[2] <= cap:
+                    return retry
+        return apex
 
     def _tap_discover(self, gcmd):
         # One-time ball_top discovery: a 3x3 grid of deep presses around
@@ -530,22 +554,17 @@ class ToolOffsetSphere:
         # climb walks to the APEX - the first grid contact is usually on
         # the shoulder, 2-3mm BELOW the top, and a shoulder height would
         # poison every depth-limited press that follows.
-        safe = self.safe_z_cold
-        hit = None
-        for dy in (-5, 0, 5):
-            for dx in (-5, 0, 5):
-                hit = self._probe_down(self.cx + dx, self.cy + dy, safe,
-                                       'discover')
-                if hit:
-                    break
-            if hit:
-                break
+        # blind search over the full configured zone (same as sphere mode)
+        # - the probe is placed "roughly" in the zone, not at the exact center
+        hit = self._scan(0)
         if not hit:
-            raise gcmd.error("Ball not found near the search center - "
-                             "place the probe at X%.0f Y%.0f (or widen the zone)"
-                             % (self.cx, self.cy))
+            raise gcmd.error("Ball not found in the scan zone (center X%.0f "
+                             "Y%.0f, %.0fx%.0fmm) - move the probe there or "
+                             "widen search_size_x/y"
+                             % (self.cx, self.cy, self.sx, self.sy))
         cur = hit
         d = 2.
+        safe = self.safe_z_cold
         for _ in range(12):
             up = None
             for (dx, dy) in ((1,0),(-1,0),(0,1),(0,-1)):
@@ -560,21 +579,114 @@ class ToolOffsetSphere:
                 d /= 2.
                 continue
             break
-        self._log("ball_top discovered: %.2f (grid contact was %.2f, "
-                  "climbed to the apex)" % (cur[2], hit[2]))
+        # The climb always chases the HIGHEST click - if the first contact
+        # was a part hanging beside the nozzle (the cool duct, ball_top +
+        # its hang), the climb locked onto that foreign line. Hop the nozzle
+        # to where that part touched: if the ball's true top is LOWER, the
+        # foreign line was real - re-climb from the true contact.
+        for (hx, hy) in self.tap_hops_a:
+            h2 = self._probe_down(cur[0] + hx, cur[1] + hy, safe, 'discover+')
+            self._log("discovery hop %+0.f,%+0.f from %.1f,%.1f: %s"
+                      % (hx, hy, cur[0], cur[1],
+                         "miss" if not h2 else "%.2f at %.1f,%.1f"
+                         % (h2[2], h2[0], h2[1])), 1)
+            if not h2:
+                # hop missed: the climb locked onto some other part. Map the
+                # neighborhood - one run tells us every contact line (ball,
+                # duct, shroud) and we seed the re-climb from the lowest
+                # local apex (the nozzle line is always the lowest)
+                # contact map; the ball's top is the highest NON-spike
+                # point (the switch stalk reads higher but is a lone spike:
+                # its neighbors drop > 0.6mm; the ball top is a flat line)
+                pts = {}
+                for gy2 in (-15, -10, -5, 0, 5, 10, 15):
+                    for gx2 in (-15, -10, -5, 0, 5, 10, 15):
+                        h3 = self._probe_down(cur[0] + gx2, cur[1] + gy2,
+                                              safe, 'map')
+                        if h3:
+                            pts[(gx2, gy2)] = h3[2]
+                            self._log("map %+d,%+d: %.2f" % (gx2, gy2, h3[2]), 1)
+                best = None
+                for (px, py), pz in pts.items():
+                    for (qx, qy) in ((5,0),(-5,0),(0,5),(0,-5)):
+                        nb = pts.get((px+qx, py+qy))
+                        if nb is not None and abs(nb - pz) <= 0.6:
+                            if best is None or pz > best[2]:
+                                best = (cur[0] + px, cur[1] + py, pz)
+                            break
+                if best and best[2] < cur[2] - 0.5:
+                    self._log("map: lowest apex %.2f at %.1f,%.1f - "
+                              "re-climbing there" % (best[2], best[0], best[1]))
+                    cur = best
+                    d = 2.
+                    for _ in range(12):
+                        up = None
+                        for (dx, dy) in ((1,0),(-1,0),(0,1),(0,-1)):
+                            h = self._probe_down(cur[0] + dx*d, cur[1] + dy*d,
+                                                 safe, 'map+')
+                            if h and h[2] > cur[2] + 0.05 and (up is None
+                                                              or h[2] > up[2]):
+                                up = h
+                        if up:
+                            cur = up
+                            continue
+                        if d > 0.5:
+                            d /= 2.
+                            continue
+                        break
+                    break
+                continue
+            if h2 and h2[2] < cur[2] - 0.5:
+                cur = h2
+                d = 2.
+                for _ in range(12):
+                    up = None
+                    for (dx, dy) in ((1,0),(-1,0),(0,1),(0,-1)):
+                        h = self._probe_down(cur[0] + dx*d, cur[1] + dy*d,
+                                             safe, 'discover+')
+                        if h and h[2] > cur[2] + 0.05 and (up is None
+                                                          or h[2] > up[2]):
+                            up = h
+                    if up:
+                        cur = up
+                        continue
+                    if d > 0.5:
+                        d /= 2.
+                        continue
+                    break
+                break
+        self._log("ball_top discovered: %.2f at %.1f,%.1f (first contact "
+                  "was %.2f)" % (cur[2], cur[0], cur[1], hit[2]))
         self._log("SPEED-UP CONFIG: set  ball_top: %.2f  in "
                   "[tool_offset_sphere] (skips this discovery "
                   "step - the run gets faster AND gentler)"
                   % cur[2], 0)
-        return cur[2]
+        return cur
 
     def _tap_run(self, gcmd):
         self._bounds()
         ball_top = gcmd.get_float('BALL_TOP', self.ball_top, minval=0.)
+        start = (self.cx, self.cy)
+        # remembered ball position from the last discovery (the probe is
+        # placed "roughly in the same spot" every time)
+        try:
+            import json as _json
+            _st = _json.load(open(self._ballpos_path))
+            start = (_st['x'], _st['y'])
+        except Exception:
+            pass
         if not ball_top:
-            ball_top = self._tap_discover(gcmd)
+            found = self._tap_discover(gcmd)
+            ball_top = found[2]
+            start = (found[0], found[1])
+        try:
+            import json as _json
+            _json.dump({'x': start[0], 'y': start[1]},
+                       open(self._ballpos_path, 'w'))
+        except Exception:
+            pass
         # ---- head A ----
-        apex_a = self._tap_measure(self.cx, self.cy, 16, 4,
+        apex_a = self._tap_measure(start[0], start[1], 4, 2,
                                    (0.9, 1.9, 2.9), ball_top,
                                    self.tap_hops_a, 'A')
         if not apex_a:
@@ -620,20 +732,26 @@ class ToolOffsetSphere:
                       "offset from the revision" % drift, 0)
         off = (apex_b[0] - apex_a2[0], apex_b[1] - apex_a2[1],
                apex_b[2] - apex_a2[2])
-        self._log("MEASURED B offset: dX%.3f dY%.3f dZ%.3f" % off, 1)
-        if (abs(off[0]) > self.max_off_xy or abs(off[1]) > self.max_off_xy
-                or abs(off[2]) > self.max_off_z):
+        self._log("MEASURED (machine frame): dX%.3f dY%.3f dZ%.3f" % off, 1)
+        # IDEX_VARS sign convention: the macros apply offset_x/y via
+        # SET_GCODE_OFFSET when T1 is active, i.e. gcode = machine + offset.
+        # The machine-frame measurement is the inverse: X/Y flip, Z as-is.
+        apply = (-off[0], -off[1], off[2])
+        self._log("IDEX_VARS values:      offset_x=%.3f offset_y=%.3f "
+                  "offset_z=%.3f" % apply, 1)
+        if (abs(apply[0]) > self.max_off_xy or abs(apply[1]) > self.max_off_xy
+                or abs(apply[2]) > self.max_off_z):
             raise gcmd.error(
                 "Measured offset dX%.2f dY%.2f dZ%.2f exceeds the plausible "
                 "range (+/-%.0f XY, +/-%.0f Z) - the ball was probably "
                 "knocked off mid-run or the switch false-triggered. "
-                "Offsets NOT applied." % (off + (self.max_off_xy,
-                                                 self.max_off_z)))
+                "Offsets NOT applied." % (apply + (self.max_off_xy,
+                                                   self.max_off_z)))
         if gcmd.get_int('DRY_RUN', 0):
             self._log("DRY_RUN: offsets are not applied", 1)
             return
-        for name, val in (('offset_x', off[0]), ('offset_y', off[1]),
-                          ('offset_z', off[2])):
+        for name, val in (('offset_x', apply[0]), ('offset_y', apply[1]),
+                          ('offset_z', apply[2])):
             self.gcode.run_script_from_command(
                 "SET_GCODE_VARIABLE MACRO=IDEX_VARS VARIABLE=%s VALUE=%.3f"
                 % (name, val))
@@ -643,7 +761,7 @@ class ToolOffsetSphere:
         except self.printer.command_error:
             pass
         self.gcode.run_script_from_command(
-            "M117 B offset: dX%.3f dY%.3f dZ%.3f" % off)
+            "M117 B offset: dX%.3f dY%.3f dZ%.3f" % apply)
     # ---------------- main cycle ----------------
     def cmd_query(self, gcmd):
         toolhead = self._toolhead()
