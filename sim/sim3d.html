@@ -2280,7 +2280,6 @@ function* tapMeasure(cx, cy, span, pitch, dips = [0.9]) {
     // beyond ~1.5mm from the hill-climb best is noise, discard it
     if (Math.abs(ex) > 1.5) ex = 0;
     if (Math.abs(ey) > 1.5) ey = 0;
-    log(`refine it${it}: cur ${cur.x.toFixed(3)},${cur.y.toFixed(3)} -> +${ex.toFixed(3)},+${ey.toFixed(3)} (dz ${rx1 && rx1.triggered ? rx1.z.toFixed(3) : '-'}/${rx2 && rx2.triggered ? rx2.z.toFixed(3) : '-'})`, 'info');
     cur = {x: cur.x + ex, y: cur.y + ey, z: cur.z};
   }
   const ap = yield* tapPress(cur.x, cur.y, floor);
@@ -2297,7 +2296,7 @@ function* algoTap() {
     // remembered spot (these MAY touch the shoulder; all later presses
     // are depth-limited and cannot). A foreign click (the hanging duct)
     // resolves by hopping the nozzle onto the ball first.
-    log(`ball_top unknown - discovery grid (deep presses)`, 'warn');
+    log(`ball_top unknown - discovery grid (deep presses; may nudge the ball ~0.2mm - this runs ONCE, set &bt=/config afterwards for micron accuracy)`, 'warn');
     let r0 = null;
     disc: for (let dy = -5; dy <= 5; dy += 5)
       for (let dx = -5; dx <= 5; dx += 5) {
