@@ -534,19 +534,76 @@ class ToolOffsetSphere:
             cur = (cur[0] + ex, cur[1] + ey, cur[2])
         ap = self._tap_press(cur[0], cur[1], floor, travel, tag)
         apex = (cur[0], cur[1], ap[2]) if ap else cur
-        # The cap gates only the SEED; the climb can still drift onto a
-        # part beside the nozzle (the duct line reports ball_top + its
-        # hang-below). A final apex above the cap is a foreign-element
-        # convergence: hop the nozzle to where that part touched the ball
-        # and measure again (one hop level deep, no loops).
-        if apex[2] > cap and hops:
+        # Decisive nozzle check: the ball must continue around the apex
+        # (see _tap_verify). A protruding part fails it - hop the nozzle
+        # to where that part touched the ball and measure again (one hop
+        # level deep, no loops).
+        if not self._tap_verify(apex, ball_top, tag):
+            # known part offsets first (fast, precise)
             for (hx, hy) in hops:
                 retry = self._tap_measure(apex[0] + hx, apex[1] + hy,
                                           4, 2, dips, ball_top, [],
                                           tag + 'hop')
-                if retry and retry[2] <= cap:
+                if retry and self._tap_verify(retry, ball_top, tag + 'v2'):
                     return retry
+            # unknown part: map the neighborhood and re-measure from the
+            # highest flat contact (the ball top line)
+            safe = self.safe_z_cold
+            pts = {}
+            for gy2 in (-15, -10, -5, 0, 5, 10, 15):
+                for gx2 in (-15, -10, -5, 0, 5, 10, 15):
+                    h3 = self._probe_down(apex[0] + gx2, apex[1] + gy2,
+                                          safe, tag + 'map')
+                    if h3:
+                        pts[(gx2, gy2)] = h3[2]
+                        self._log("%s map %+d,%+d: %.2f"
+                                  % (tag, gx2, gy2, h3[2]), 1)
+            best = None
+            for (px, py), pz in pts.items():
+                for (qx, qy) in ((5,0),(-5,0),(0,5),(0,-5)):
+                    nb = pts.get((px+qx, py+qy))
+                    if nb is not None and abs(nb - pz) <= 0.6:
+                        if best is None or pz > best[2]:
+                            best = (apex[0] + px, apex[1] + py, pz)
+                        break
+            if best:
+                retry = self._tap_measure(best[0], best[1], 4, 2,
+                                          dips, ball_top, [], tag + 'map2')
+                if retry and self._tap_verify(retry, ball_top, tag + 'v3'):
+                    return retry
+            self._log("%s: could NOT verify the nozzle touched the ball "
+                      "- refusing to report a foreign contact" % tag, 0)
+            return None
         return apex
+
+    def _tap_verify(self, apex, ball_top, tag):
+        # Is the apex really the NOZZLE on the ball top?
+        # The nozzle is the only head part at offset (0,0): if the apex was
+        # measured with it, the ball continues around - 4 presses on a
+        # r=3.5mm ring must all click at z0 - r^2/2R. A protruding part
+        # sits (dx,dy) away from the nozzle: its "apex" is the ball center
+        # seen through the part, and a ring around it is off the ball on
+        # every side - all presses miss. (Climb alone cannot tell them
+        # apart: a part hanging below the nozzle reads HIGHER, and the
+        # climb chases the highest click.)
+        R = self.ball_r
+        r = min(3.5, R * 0.7)
+        expect = r * r / (2. * R)
+        floor = apex[2] - expect - 1.0
+        travel = ball_top + 3.
+        for (dx, dy) in ((1,0),(-1,0),(0,1),(0,-1)):
+            h = self._tap_press(apex[0] + dx*r, apex[1] + dy*r,
+                                floor, travel, tag + 'verify')
+            if not h:
+                self._log("verify MISS at %+0.1f,%+0.1f - the apex was a "
+                          "protruding part, not the nozzle" % (dx*r, dy*r), 1)
+                return False
+            if abs((apex[2] - h[2]) - expect) > 0.45:
+                self._log("verify height off by %.2f at %+0.1f,%+0.1f"
+                          % (abs((apex[2] - h[2]) - expect), dx*r, dy*r), 1)
+                return False
+        self._log("verify OK: ball surface confirmed on all 4 sides", 1)
+        return True
 
     def _tap_discover(self, gcmd):
         # One-time ball_top discovery: a 3x3 grid of deep presses around
