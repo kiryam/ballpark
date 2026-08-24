@@ -526,23 +526,47 @@ class ToolOffsetSphere:
 
     def _tap_discover(self, gcmd):
         # One-time ball_top discovery: a 3x3 grid of deep presses around
-        # the configured search center. These presses may touch the ball's
-        # shoulder; everything after is depth-limited and gentle.
+        # the configured search center finds the ball, then a short hill
+        # climb walks to the APEX - the first grid contact is usually on
+        # the shoulder, 2-3mm BELOW the top, and a shoulder height would
+        # poison every depth-limited press that follows.
         safe = self.safe_z_cold
+        hit = None
         for dy in (-5, 0, 5):
             for dx in (-5, 0, 5):
                 hit = self._probe_down(self.cx + dx, self.cy + dy, safe,
                                        'discover')
                 if hit:
-                    self._log("ball_top discovered: %.2f" % hit[2])
-                    self._log("SPEED-UP CONFIG: set  ball_top: %.2f  in "
-                              "[tool_offset_sphere] (skips this discovery "
-                              "step - the run gets faster AND gentler)"
-                              % hit[2], 0)
-                    return hit[2]
-        raise gcmd.error("Ball not found near the search center - "
-                         "place the probe at X%.0f Y%.0f (or widen the zone)"
-                         % (self.cx, self.cy))
+                    break
+            if hit:
+                break
+        if not hit:
+            raise gcmd.error("Ball not found near the search center - "
+                             "place the probe at X%.0f Y%.0f (or widen the zone)"
+                             % (self.cx, self.cy))
+        cur = hit
+        d = 2.
+        for _ in range(12):
+            up = None
+            for (dx, dy) in ((1,0),(-1,0),(0,1),(0,-1)):
+                h = self._probe_down(cur[0] + dx*d, cur[1] + dy*d, safe,
+                                     'discover+')
+                if h and h[2] > cur[2] + 0.05 and (up is None or h[2] > up[2]):
+                    up = h
+            if up:
+                cur = up
+                continue
+            if d > 0.5:
+                d /= 2.
+                continue
+            break
+        self._log("ball_top discovered: %.2f (grid contact was %.2f, "
+                  "climbed to the apex)" % (cur[2], hit[2]))
+        self._log("SPEED-UP CONFIG: set  ball_top: %.2f  in "
+                  "[tool_offset_sphere] (skips this discovery "
+                  "step - the run gets faster AND gentler)"
+                  % cur[2], 0)
+        return cur[2]
 
     def _tap_run(self, gcmd):
         self._bounds()
