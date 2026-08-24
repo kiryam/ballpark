@@ -2040,6 +2040,22 @@ const M = {
         this.clicks++;
         const good = hit.el === 'nozzle';
         if (!good) this.bad++;
+        // honest ball handling: a press far from the apex contacts the
+        // shoulder - the tangential force nudges the ball away a little.
+        // Within the ~35-degree cone around the top the slide component is
+        // negligible. This models what the real printer did (5.7mm walk).
+        if (NUDGE) {
+          const cx = w.x + (hit.dx || 0), cy = w.y + (hit.dy || 0);
+          const d = Math.hypot(cx - ball.x, cy - ball.y);
+          const cone = BALL_R * Math.sin(35*Math.PI/180);
+          if (d > cone) {
+            const push = Math.min(0.5, (d - cone) * 0.08);
+            const a = Math.atan2(cy - ball.y, cx - ball.x);
+            ball.x += Math.cos(a) * push; ball.y += Math.sin(a) * push;
+            S.ballDrift += push;
+            log(`⚠ shoulder press nudged the ball by ${push.toFixed(2)}mm (contact ${d.toFixed(1)}mm off the apex)`, 'warn');
+          }
+        }
         // mark AT the element's contact point (pin clicks show on the pin),
         // colored per element - a green dot can only be a NOZZLE click
         mark(w.x + (hit.dx || 0), w.y + (hit.dy || 0), hit.z, markColor(hit.el));
@@ -2106,7 +2122,7 @@ const M = {
 //  State + log
 // =====================================================================
 const S = {running: false, fast: false, gen: null, status: 'idle', hist: [], replayT: null,
-  logbuf: [], apexA: null, apexB: null, eoff: null, eoffErr: null,
+  logbuf: [], apexA: null, apexB: null, eoff: null, eoffErr: null, ballDrift: 0, ballStart: null,
   marks: [], pathA: [], pathB: []};
 function log(msg, cls='info') {
   S.logbuf.push(msg);
@@ -2181,7 +2197,154 @@ function* travel(x, y, z = 60) { yield `G0 Z${z.toFixed(1)}`; yield `G0 X${x.toF
 // It can be provided externally to speed things up (?bt=49.5); otherwise the first pass
 // runs at the conservative height 56 (above any ball up to D15), measures the top itself
 // and prints the discovered config value. Ball XY is deliberately never saved.
+// =====================================================================
+// ALGORITHM "tap" (v9): the ball is only ever touched from ABOVE.
+// Every descent is depth-limited to (ballTop - dip): outside a ~2.9mm cone
+// around the apex the nozzle physically cannot reach the sphere, so an
+// off-apex press MISSES without touching anything. Inside the cone the
+// contact force goes nearly through the ball center - no sideways drag.
+// Needs ballTop (config/&bt=, one-time discovery); XY comes from a coarse
+// grid around the remembered placement + a hill climb + a parabola
+// refinement over the flat top (z(u) = top - u^2/2R).
+// =====================================================================
+function* tapPress(x, y, floor) {
+  yield* travel(x, y, RUN_CFG.ballTop + 3);
+  return yield `G38.2 Z${floor.toFixed(2)} F240`;
+}
+function* tapNozzleAt(x, y, floor) {
+  // press at (x,y); a FOREIGN click means the ball is under that element
+  // (offset dx,dy from the nozzle) - hop the nozzle there and press again.
+  // Returns a nozzle click or null. Bounded hops.
+  let px = x, py = y;
+  for (let i = 0; i < 3; i++) {
+    const r = yield* tapPress(px, py, floor);
+    if (!(r && r.triggered && r.el !== 'glitch')) return null;
+    if (r.el === 'nozzle') return r;
+    px = r.x + (r.dx || 0); py = r.y + (r.dy || 0);
+  }
+  return null;
+}
+function* tapMeasure(cx, cy, span, pitch, dips = [0.9]) {
+  // dip = how deep below the known top a press may go. Head A: 0.9mm
+  // (cone ~2.9mm, gentlest). Head B: its dZ is UNKNOWN (that is what we
+  // calibrate) - try shallow floors first and deepen only while nothing
+  // clicks: the contact then happens at the smallest sufficient depth.
+  const R = BALL_R;
+  let seed = null, floor = 0;
+  for (const dip of dips) {
+    floor = RUN_CFG.ballTop - dip;
+    grid: for (let gy = span; gy >= -span; gy -= pitch)
+      for (let gx = -span; gx <= span; gx += pitch) {
+        // a vostok duct hangs BELOW the nozzle and can click first: resolve
+        // any click to a nozzle click by hopping onto the contacted spot
+        const r = yield* tapPress(cx + gx, cy + gy, floor);
+        if (r && r.triggered && r.el !== 'glitch') {
+          if (r.el === 'nozzle') { seed = r; break grid; }
+          const nz = yield* tapNozzleAt(r.x + (r.dx || 0), r.y + (r.dy || 0), floor);
+          if (nz) { seed = nz; break grid; }
+        }
+      }
+    if (seed) break;
+  }
+  if (!seed) return null;
+  let cur = seed, d = 2, clicks = 0;
+  climb: while (clicks < 120) {
+    let up = null;
+    for (const [dx, dy] of [[1,0],[-1,0],[0,1],[0,-1]]) {
+      const r = yield* tapPress(cur.x + dx*d, cur.y + dy*d, floor);
+      clicks++;
+      if (r && r.triggered && r.el !== 'glitch'
+          && r.z > cur.z + 0.01 && (!up || r.z > up.z)) up = r;
+    }
+    if (up) { cur = up; continue climb; }
+    if (d > 0.5) { d /= 2; continue climb; }
+    break climb;
+  }
+  // parabola refine over the flat top: u = -(z(+s)-z(-s))*R/(2s),
+  // center = cur - u  =>  correction = +(z(+s)-z(-s))*R/(2s)
+  const sp = 0.5;
+  const rx1 = yield* tapPress(cur.x + sp, cur.y, floor);
+  const rx2 = yield* tapPress(cur.x - sp, cur.y, floor);
+  const ry1 = yield* tapPress(cur.x, cur.y + sp, floor);
+  const ry2 = yield* tapPress(cur.x, cur.y - sp, floor);
+  let ex = 0, ey = 0;
+  if (rx1 && rx1.triggered && rx2 && rx2.triggered)
+    ex = (rx1.z - rx2.z) * R / (2*sp);
+  if (ry1 && ry1.triggered && ry2 && ry2.triggered)
+    ey = (ry1.z - ry2.z) * R / (2*sp);
+  // a readout glitch in one sample throws the center far away - anything
+  // beyond ~1.5mm from the hill-climb best is noise, discard it
+  if (Math.abs(ex) > 1.5) ex = 0;
+  if (Math.abs(ey) > 1.5) ey = 0;
+  const ap = yield* tapPress(cur.x + ex, cur.y + ey, floor);
+  return (ap && ap.triggered && ap.el !== 'glitch') ? ap : cur;
+}
+function* algoTap() {
+  log(`algo: tap (top-only presses, dip cone ~2.9mm)`, 'info');
+  // the probe is placed "roughly in the same spot" (+/-7mm), like on the
+  // real printer - the remembered center is NOT the true ball position
+  const rem = {x: ball.x + (rng()-0.5)*14, y: ball.y + (rng()-0.5)*14};
+  if (RUN_CFG.ballTop === null) {
+    // one-time discovery: a 3x3 grid of deep presses around the
+    // remembered spot (these MAY touch the shoulder; all later presses
+    // are depth-limited and cannot). A foreign click (the hanging duct)
+    // resolves by hopping the nozzle onto the ball first.
+    log(`ball_top unknown - discovery grid (deep presses)`, 'warn');
+    let r0 = null;
+    disc: for (let dy = -5; dy <= 5; dy += 5)
+      for (let dx = -5; dx <= 5; dx += 5) {
+        yield* travel(rem.x + dx, rem.y + dy, 56);
+        const r = yield `G38.2 Z39 F240`;
+        if (r && r.triggered && r.el !== 'glitch') {
+          if (r.el === 'nozzle') { r0 = r; break disc; }
+          yield* travel(r.x + (r.dx || 0), r.y + (r.dy || 0), 56);
+          const r2 = yield `G38.2 Z39 F240`;
+          if (r2 && r2.triggered && r2.el === 'nozzle') { r0 = r2; break disc; }
+        }
+      }
+    if (!r0) { S.status = 'not found'; return; }
+    RUN_CFG.ballTop = r0.z;
+    log(`ball_top discovered: ${r0.z.toFixed(2)} (set &bt= to skip this)`, 'good');
+  }
+  let apex = yield* tapMeasure(rem.x, rem.y, 16, 4);
+  if (!apex) { S.status = 'not found'; return; }
+  S.apexA = {x: apex.x, y: apex.y, z: apex.z};
+  log(`Apex (head A): X${apex.x.toFixed(2)} Y${apex.y.toFixed(2)} Z${apex.z.toFixed(2)}`, 'good');
+  mark(apex.x, apex.y, apex.z, 0x00ff00);
+  // park A on the LEFT before the switch: the gantry keeps A left of B,
+  // a right-parked A would lock B out of the whole bed
+  yield `G0 Z60`;
+  yield `G0 X${PARK_A} Y${apex.y.toFixed(2)}`;
+  yield `T1`;
+  // stored B offset (stale by ~1mm): commands must place B's NOZZLE on
+  // apexA - nozzle_B(cmd) = cmd + nB, so cmd = apexA - storedOffset
+  const stale = {x: (nB.x - nA.x) + (rng()-0.5)*2, y: (nB.y - nA.y) + (rng()-0.5)*2};
+  let apexB = yield* tapMeasure(apex.x - stale.x, apex.y - stale.y, 6, 3, [0.9, 1.9, 2.9]);
+  if (!apexB) { S.status = 'not found (B)'; return; }
+  S.apexB = {x: apexB.x, y: apexB.y, z: apexB.z};
+  log(`Apex (head B): X${apexB.x.toFixed(2)} Y${apexB.y.toFixed(2)} Z${apexB.z.toFixed(2)}`, 'good');
+  mark(apexB.x, apexB.y, apexB.z, 0x00ff00);
+  yield `G0 Z60`;
+  yield `G0 X${PARK_B} Y${apex.y.toFixed(2)}`;
+  yield `T0`;
+  const a2 = yield* tapMeasure(S.apexA.x, S.apexA.y, 3, 3);
+  const apexA2 = a2 || S.apexA;
+  const drift = Math.hypot(apexA2.x - S.apexA.x, apexA2.y - S.apexA.y);
+  log(`Apex (head A, revision): X${apexA2.x.toFixed(2)} Y${apexA2.y.toFixed(2)} Z${apexA2.z.toFixed(2)}`, 'good');
+  log(`ball drift between passes: ${drift.toFixed(2)}mm`, drift < 0.2 ? 'info' : 'warn');
+  S.eoff = {dx: S.apexB.x - apexA2.x, dy: S.apexB.y - apexA2.y, dz: S.apexB.z - apexA2.z};
+  const trueOff = {dx: nA.x - nB.x, dy: nA.y - nB.y, dz: nA.z - nB.z};
+  const e = {dx: S.eoff.dx - trueOff.dx, dy: S.eoff.dy - trueOff.dy, dz: S.eoff.dz - trueOff.dz};
+  S.eoffErr = e;
+  log(`MEASURED B offset: dX=${S.eoff.dx.toFixed(3)} dY=${S.eoff.dy.toFixed(3)} dZ=${S.eoff.dz.toFixed(3)}`, 'warn');
+  log(`TRUE B offset:      dX=${trueOff.dx.toFixed(3)} dY=${trueOff.dy.toFixed(3)} dZ=${trueOff.dz.toFixed(3)}`, 'info');
+  log(`offset error: dX ${e.dx.toFixed(3)} dY ${e.dy.toFixed(3)} dZ ${e.dz.toFixed(3)}`,
+    Math.abs(e.dx)<0.5 && Math.abs(e.dy)<0.5 && Math.abs(e.dz)<0.5 ? 'good' : 'bad');
+  yield `M117 B offset: dX=${S.eoff.dx.toFixed(3)} dY=${S.eoff.dy.toFixed(3)} dZ=${S.eoff.dz.toFixed(3)}`;
+}
 const RUN_CFG = {ballTop: null};
+const NUDGE = (new URLSearchParams(location.search).get('nudge') ?? '1') !== '0';
+const ALGO = new URLSearchParams(location.search).get('algo') || 'sphere';
 function* press(x, y) {
   // travel height must clear not just the nozzle but the LOWEST element:
   // vostok duct tubes hang ~2.8mm below the nozzle tip
@@ -2520,9 +2683,9 @@ const VOSTOK_PARTS = {
   ],
 };
 const VOSTOK_TUBE = {file: 'vostok_x_tube.stl', len: 500, dy: 71.5, dz: -40.12}; // vs nozzle (y up, z front)
-const SIM_VER = 'v84';
+const SIM_VER = 'v85';
 const VBUST = Date.now() % 1000000;
-document.getElementById('hudver').textContent = SIM_VER + ' (green dot = a click the physics engine attributed to the NOZZLE disc at the head origin; if the mesh visibly disagrees, the STL placement is wrong - report it)';
+document.getElementById('hudver').textContent = SIM_VER + '/' + ALGO + ' (green dot = a click the physics engine attributed to the NOZZLE disc at the head origin; if the mesh visibly disagrees, the STL placement is wrong - report it)';
 let vostokGeoms = null;
 try {
   const cache = {};
@@ -2905,12 +3068,13 @@ function startRun(seedPos) {
   resetRun();
   S.hist = [];
   if (seedPos) { ball.x = seedPos[0]; ball.y = seedPos[1]; }
+  S.ballDrift = 0; S.ballStart = {x: ball.x, y: ball.y};
   randToolOffsets();
   M.noise = document.getElementById('noise').checked;
   scene.remove(headMeshA); headMeshA = buildHead(false); scene.add(headMeshA);
   S.running = true; S.status = 'running';
   replayBar.style.display = 'none';
-  S.gen = algoSphere();
+  S.gen = ALGO === 'tap' ? algoTap() : algoSphere();
   pump(S.gen.next());
   updMetrics();
 }
@@ -3163,30 +3327,31 @@ if (location.search.includes('test=grid') || location.search.includes('test=sing
           // the offset error happens to cancel out
           const tA = {x: ball.x - nA.x, y: ball.y - nA.y, z: BALL_CZ + BALL_R - nA.z};
           const tB = {x: ball.x - nB.x, y: ball.y - nB.y, z: BALL_CZ + BALL_R - nB.z};
-          const axA = Math.max(Math.hypot(S.apexA.x-tA.x, S.apexA.y-tA.y), Math.abs(S.apexA.z-tA.z));
-          const axB = Math.max(Math.hypot(S.apexB.x-tB.x, S.apexB.y-tB.y), Math.abs(S.apexB.z-tB.z));
+          const axA = S.apexA ? Math.max(Math.hypot(S.apexA.x-tA.x, S.apexA.y-tA.y), Math.abs(S.apexA.z-tA.z)) : 99;
+          const axB = S.apexB ? Math.max(Math.hypot(S.apexB.x-tB.x, S.apexB.y-tB.y), Math.abs(S.apexB.z-tB.z)) : 99;
+          const drift = S.ballStart ? Math.hypot(ball.x - S.ballStart.x, ball.y - S.ballStart.y) : 0;
           const r = {pos:`(${p[0]},${p[1]})`, // axA/axB gate: the apex record must be ON THE BALL in each head's frame.
             // A foreign-element apex (the decoy pin) sits >=5mm off the top;
             // with 3% readout noise + shroud-truncated rings the best nozzle
             // click can sit ~1.5mm down the shoulder - still the ball, so
             // the gate is 2.0mm, not sub-mm
-            ok: !!(S.eoffErr && Math.abs(S.eoffErr.dx)<0.5 && Math.abs(S.eoffErr.dy)<0.5 && Math.abs(S.eoffErr.dz)<0.5 && M.ballMoves === 0 && !S.foreignApex && axA < 2.0 && axB < 2.0),
+            ok: !!(S.eoffErr && Math.abs(S.eoffErr.dx)<0.5 && Math.abs(S.eoffErr.dy)<0.5 && Math.abs(S.eoffErr.dz)<0.5 && M.ballMoves === 0 && !S.foreignApex && axA < 2.0 && axB < 2.0 && (S.ballStart ? Math.hypot(ball.x-S.ballStart.x, ball.y-S.ballStart.y) : 0) < 0.5),
             exy: S.eoffErr ? Math.hypot(S.eoffErr.dx, S.eoffErr.dy) : NaN,
             ez: S.eoffErr ? Math.abs(S.eoffErr.dz) : NaN,
             clicks: M.clicks, bad: M.bad, dist: M.dist, mv: M.ballMoves,
             axA, axB};
           all.push(r);
-          rows.push(`${r.ok?'✓':'✗'} ${r.pos} XY${isNaN(r.exy)?'-':r.exy.toFixed(3)} Z${isNaN(r.ez)?'-':r.ez.toFixed(3)} cl${r.clicks} bad${r.bad} mv${r.mv} axA${axA.toFixed(2)} axB${axB.toFixed(2)}${S.foreignApex?' FOREIGN!':''} path${Math.round(r.dist)}mm`);
+          rows.push(`${r.ok?'✓':'✗'} ${r.pos} XY${isNaN(r.exy)?'-':r.exy.toFixed(3)} Z${isNaN(r.ez)?'-':r.ez.toFixed(3)} cl${r.clicks} bad${r.bad} mv${r.mv} axA${axA.toFixed(2)} axB${axB.toFixed(2)} dr${drift.toFixed(2)}${S.foreignApex?' FOREIGN!':''} path${Math.round(r.dist)}mm`);
           if (!r.ok) rows.push('--- failure log ---\n' + S.logbuf.join('\n'));
           else S.logbuf = [];
         }
       const oks = all.filter(r=>r.ok);
       const med = a => a.length ? a.slice().sort((x,y)=>x-y)[Math.floor(a.length/2)] : NaN;
-      const sum = `GRID3D [sphere${M.noise?'+noise':''}${location.search.includes('test=pin')?'+pin@0':''}]: ${oks.length}/${all.length} ok | medXY ${med(oks.map(r=>r.exy)).toFixed(3)} medZ ${med(oks.map(r=>r.ez)).toFixed(3)} | cl med${Math.round(med(all.map(r=>r.clicks)))} | moves ${all.reduce((s,r)=>s+r.mv,0)} | path med${Math.round(med(all.map(r=>r.dist)))}mm`;
+      const sum = `GRID3D [${ALGO}${M.noise?'+noise':''}${NUDGE?'':' nonudge'}${location.search.includes('test=pin')?'+pin@0':''}]: ${oks.length}/${all.length} ok | medXY ${med(oks.map(r=>r.exy)).toFixed(3)} medZ ${med(oks.map(r=>r.ez)).toFixed(3)} | cl med${Math.round(med(all.map(r=>r.clicks)))} | moves ${all.reduce((s,r)=>s+r.mv,0)} | path med${Math.round(med(all.map(r=>r.dist)))}mm`;
       log(sum, oks.length===all.length?'good':'bad');
       document.getElementById('batchout').textContent = sum + '\n' + rows.join('\n');
       document.title = 'GRID3D: ' + sum;
-    } catch (e) { console.error(e); document.title = 'GRID3D ERROR: ' + e.message; }
+    } catch (e) { console.error(e.stack); document.title = 'GRID3D ERROR: ' + e.message + ' @ ' + (e.stack ? (e.stack.split('\n')[1]||'').trim().slice(0,90) : ''); }
   }, 600);
 }
 applyNBFromSliders();
