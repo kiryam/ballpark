@@ -736,12 +736,7 @@ class ToolOffsetSphere:
             found = self._tap_discover(gcmd)
             ball_top = found[2]
             start = (found[0], found[1])
-        try:
-            import json as _json
-            _json.dump({'x': start[0], 'y': start[1]},
-                       open(self._ballpos_path, 'w'))
-        except Exception:
-            pass
+
         # ---- head A ----
         apex_a = self._tap_measure(start[0], start[1], 4, 2,
                                    (0.9, 1.9, 2.9), ball_top,
@@ -749,6 +744,12 @@ class ToolOffsetSphere:
         if not apex_a:
             raise gcmd.error("Head A did not find the ball (tap mode)")
         self._log("apex A: X%.2f Y%.2f Z%.2f" % apex_a, 1)
+        try:
+            import json as _json
+            _json.dump({'x': apex_a[0], 'y': apex_a[1]},
+                       open(self._ballpos_path, 'w'))
+        except Exception:
+            pass
         # ---- park A LEFT, switch to B ----
         self._move(apex_a[0], apex_a[1], ball_top + 6., self.lift_speed)
         self._move(self._park(True), apex_a[1], ball_top + 6.,
@@ -762,7 +763,7 @@ class ToolOffsetSphere:
         except Exception:
             pox, poy = 0., 0.
         self._log("head B prior from stored offset: %.2f,%.2f" % (pox, poy), 1)
-        apex_b = self._tap_measure(apex_a[0] - pox, apex_a[1] - poy, 3, 2,
+        apex_b = self._tap_measure(apex_a[0] - pox, apex_a[1] - poy, 12, 4,
                                    (0.9, 1.9, 2.9), ball_top,
                                    self.tap_hops_b, 'B')
         if not apex_b:
@@ -791,8 +792,10 @@ class ToolOffsetSphere:
                apex_b[2] - apex_a2[2])
         self._log("MEASURED (machine frame): dX%.3f dY%.3f dZ%.3f" % off, 1)
         # IDEX_VARS sign convention: the macros apply offset_x/y via
-        # SET_GCODE_OFFSET when T1 is active, i.e. gcode = machine + offset.
-        # The machine-frame measurement is the inverse: X/Y flip, Z as-is.
+        # SET_GCODE_OFFSET when T1 is active; Klipper: gcode = machine + adj
+        # => machine = gcode - adj. For B's nozzle to land on the same
+        # PHYSICAL point as A's at the same gcode: adj = apexA - apexB
+        # (the machine-frame measurement inverted). Z as measured.
         apply = (-off[0], -off[1], off[2])
         self._log("IDEX_VARS values:      offset_x=%.3f offset_y=%.3f "
                   "offset_z=%.3f" % apply, 1)
