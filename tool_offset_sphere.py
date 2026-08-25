@@ -791,12 +791,12 @@ class ToolOffsetSphere:
         off = (apex_b[0] - apex_a2[0], apex_b[1] - apex_a2[1],
                apex_b[2] - apex_a2[2])
         self._log("MEASURED (machine frame): dX%.3f dY%.3f dZ%.3f" % off, 1)
-        # IDEX_VARS sign convention: the macros apply offset_x/y via
-        # SET_GCODE_OFFSET when T1 is active; Klipper: gcode = machine + adj
-        # => machine = gcode - adj. For B's nozzle to land on the same
-        # PHYSICAL point as A's at the same gcode: adj = apexA - apexB
-        # (the machine-frame measurement inverted). Z as measured.
-        apply = (-off[0], -off[1], off[2])
+        # IDEX_VARS sign convention (verified on the real printer,
+        # 2026-08-25): the stored offset equals the machine-frame
+        # measurement as-is - offset_x/y = apexB - apexA, offset_z = dZ.
+        # (The macros' SET_GCODE_OFFSET consumes it such that the flip
+        # was wrong: with -8.341 the heads mirrored around the target.)
+        apply = (off[0], off[1], off[2])
         self._log("IDEX_VARS values:      offset_x=%.3f offset_y=%.3f "
                   "offset_z=%.3f" % apply, 1)
         if (abs(apply[0]) > self.max_off_xy or abs(apply[1]) > self.max_off_xy
