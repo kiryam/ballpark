@@ -1,21 +1,669 @@
-# Ballpark — IDEX toolhead offset calibration via a ball probe.
-# Port of the sphere-v8 algorithm from the 3D simulator (sim/sim3d.html),
-# validated there on stress grids (noise/slop/ball bumps): 23/23, ~0.03 mm.
+# Ballpark v10 - IDEX toolhead offset calibration via a ball probe.
 #
-# Cycle: blind scan -> hill-climb by click height -> escape rings ->
-# sphere rings -> LSQ fit + RANSAC -> verify -> head B -> revision A ->
-# SET_GCODE_VARIABLE IDEX_VARS + SAVE_OFFSETS_TO_DISK.
+# Complete rewrite of the v8/v9 scan/hill-climb/hop-table algorithm
+# (see ANALYSIS.md for the problem catalog). Core ideas:
+#   - one primitive: a depth-limited vertical press; everything else is
+#     built from presses;
+#   - a local paraboloid fit is BOTH the apex estimator (Newton-style
+#     convergence, 2-3 rounds) AND the "is it really the ball" test
+#     (a flat foreign contact does not converge) - verification happens
+#     inside every round, not after the whole measurement;
+#   - no head geometry anywhere: foreign (side) clicks are handled by
+#     expanding rings that only use ball geometry; works for any head;
+#   - ball_top is self-healing: head A's measured apex re-anchors the
+#     run and is persisted in the state file - no manual config;
+#   - every loop has a budget; exhaustion raises a clear error instead
+#     of hanging;
+#   - the algorithm core is pure Python (class BallparkCore) and talks
+#     to hardware through a small interface object - the same core runs
+#     on the printer (Klipper adapter below) and in the test harness
+#     (tests/sim_harness.py).
 #
-# Minimal install (the ONLY required option is the pin):
-#
-#   [tool_offset_sphere]
-#   pin: ^endstop7
-#
-# No head geometry is assumed (multi-resolution scan down to a
-# nozzle-only grid). Ball height is optional: a cold start discovers it
-# and prints the value to set for faster runs. Ball XY is never saved.
+# Config: pin (required) + a handful of physical constants. Ball XY and
+# ball_top live in <config>/ballpark/.ball-state.json and update themselves.
 
 import math
+import os
+import json
+import time
+
+
+# =====================================================================
+#  Core - pure algorithm, no Klipper dependencies.
+# =====================================================================
+
+class CoreError(Exception):
+    pass
+
+
+class BallparkCore:
+    # tier depths (mm below the working top)
+    DIP_TOP = 1.0          # top-cone tier: only the ~3.2mm cone clicks
+    DIP_PRESENCE = 3.5     # presence tier: the ball shoulder is heard
+    DIP_ASCEND = 0.7       # ring search floor below a foreign click
+    # convergence
+    STENCIL_S = 2.2        # first-round stencil radius
+    # polish ring: 8 points on ONE radius - maximum slope leverage per
+    # press (the apex xy comes from symmetric z-differences; sensitivity
+    # dz/du grows with u). Must stay INSIDE the 35-degree contact cone
+    # (R*sin35 = 2.87 for R=5): presses there never nudge the ball, so
+    # head B and the revision measure the same surface. The rounds
+    # deliver P within ~0.15mm, so 2.6 + 0.15 < 2.87 holds.
+    POLISH_R = 2.6
+    CONFIRM_TOL = 0.2      # confirm press vs fit (noise + ball walk)
+    # fit acceptance window (effective radius must look like the ball)
+    REFF_MIN_F = 0.5
+    REFF_MAX_ADD = 3.5
+    # budgets (hard guarantees against hangs)
+    MAX_PRESSES = 700     # anti-hang bound, not a target: typical runs
+                          # use ~110 presses, a fresh first-ever run with
+                          # a far-off hint may legitimately use ~500
+    MAX_SECONDS = 1800.
+    MAX_CANDIDATES = 4     # anchors tried per head measurement
+    MAX_ASCEND_HOPS = 4    # re-centers while climbing away from a side line
+
+    def __init__(self, hw, log, clock, ball_r=5., bounds=(-10., 300., 0., 260.),
+                 edge_margin=15., floor_z=38., travel_cold_z=58.):
+        # hw interface: press, park, switch_b, switch_a, prior, position,
+        # state_load, state_save
+        self.hw = hw
+        self.log = log        # callable(msg, level=1)
+        self.clock = clock
+        self.ball_r = ball_r
+        self.bounds = bounds  # xmin, xmax, ymin, ymax (machine)
+        self.edge = edge_margin
+        self.floor_z = floor_z
+        self._travel_cold = travel_cold_z
+        self.press_count = 0
+        self.t0 = clock()
+        self._travel_z = travel_cold_z
+        self.click_log = []
+
+    # ---------------- infrastructure ----------------
+    def _budget(self):
+        if self.press_count >= self.MAX_PRESSES:
+            raise CoreError("press budget exhausted (%d presses) - aborting "
+                            "instead of looping forever. The ball was not "
+                            "identified; nothing was applied." % self.MAX_PRESSES)
+        if self.clock() - self.t0 > self.MAX_SECONDS:
+            raise CoreError("time budget exhausted (%.0f min) - aborting. "
+                            "Nothing was applied." % (self.MAX_SECONDS / 60.))
+
+    def _clamp(self, x, y):
+        xmin, xmax, ymin, ymax = self.bounds
+        return (max(xmin + self.edge, min(xmax - self.edge, x)),
+                max(ymin + self.edge, min(ymax - self.edge, y)))
+
+    def _press(self, x, y, floor, tag):
+        self._budget()
+        x, y = self._clamp(x, y)
+        floor = max(floor, self.floor_z)
+        hit = self.hw.press(x, y, floor, self._travel_z)
+        self.press_count += 1
+        if hit:
+            self.click_log.append(hit)
+            self.log(". %s(%.1f,%.1f) click Z%.2f" % (tag, x, y, hit[2]), 2)
+        return hit
+
+    def _ring(self, cx, cy, rho, n):
+        for k in range(n):
+            a = k / float(n) * 2. * math.pi
+            yield self._clamp(cx + rho * math.cos(a), cy + rho * math.sin(a))
+
+    def _ring_presses(self, cx, cy, rho, floor, tag):
+        n = max(8, int(math.ceil(2. * math.pi * rho / 8.)))
+        out = []
+        for (x, y) in self._ring(cx, cy, rho, n):
+            h = self._press(x, y, floor, tag)
+            if h:
+                out.append(h)
+        return out
+
+    # ---------------- paraboloid fit ----------------
+    def _fit_apex(self, pts):
+        """Fit a dome; returns (x0, y0, z0, reff) or None.
+        Robust against readout glitches: one false click tilts a plain
+        least-squares paraboloid so much that honest points end up with
+        the largest residuals (sequential dropping fails). Instead try
+        every leave-one-out and leave-two-out subset, score by inliers
+        against ALL points, keep the best. 9 points -> 46 tiny solves -
+        negligible next to a physical press."""
+        # z = c + bx*x + by*y + a*(x^2+y^2)  ->  apex (x0,y0,z0), reff=1/2a
+        # NOTE: fit in coordinates centered on the stencil centroid - with
+        # machine coordinates (~165) over a ~4mm stencil the raw normal
+        # equations are catastrophically ill-conditioned.
+        def solve(points):
+            n = len(points)
+            if n < 4:
+                return None
+            mx = sum(p[0] for p in points) / n
+            my = sum(p[1] for p in points) / n
+            # normal equations M*s = v, params [c, bx, by, a] (centered)
+            M = [[0.] * 5 for _ in range(4)]
+            for (x, y, z) in points:
+                x -= mx
+                y -= my
+                row = [1., x, y, x * x + y * y]
+                for i in range(4):
+                    for j in range(4):
+                        M[i][j] += row[i] * row[j]
+                    M[i][4] += row[i] * z
+            for col in range(4):
+                piv = col
+                for r2 in range(col + 1, 4):
+                    if abs(M[r2][col]) > abs(M[piv][col]):
+                        piv = r2
+                M[col], M[piv] = M[piv], M[col]
+                if abs(M[col][col]) < 1e-9:
+                    return None
+                for r2 in range(col + 1, 4):
+                    f = M[r2][col] / M[col][col]
+                    for c2 in range(col, 5):
+                        M[r2][c2] -= f * M[col][c2]
+            s = [0.] * 4
+            for r2 in range(3, -1, -1):
+                v = M[r2][4]
+                for c2 in range(r2 + 1, 4):
+                    v -= M[r2][c2] * s[c2]
+                s[r2] = v / M[r2][r2]
+            c, bx, by, a = s
+            if a >= -1e-6:
+                return None       # flat (a~0) or a bowl (a>0) - not a dome
+            x0, y0 = -bx / (2. * a), -by / (2. * a)
+            return (x0 + mx, y0 + my, c - (bx * bx + by * by) / (4. * a),
+                    -1. / (2. * a))
+        fit = solve(pts)
+        if fit is None:
+            return None
+        # exhaustive glitch rejection (see docstring)
+        def res(f, p):
+            u2 = (p[0] - f[0]) ** 2 + (p[1] - f[1]) ** 2
+            return abs(p[2] - (f[2] - u2 / (2. * f[3])))
+        n = len(pts)
+        subsets = [()]  # the empty drop = the full set
+        subsets += [(i,) for i in range(n)]
+        subsets += [(i, j) for i in range(n) for j in range(i + 1, n)]
+        best = None       # (score, fit); score = -sum of capped residuals
+        for drop in subsets:
+            work = [p for k, p in enumerate(pts) if k not in drop]
+            f = solve(work)
+            if f is None:
+                continue
+            # capped residual sum over ALL points: a fit that smears one
+            # outlier across the cloud scores worse than a tight fit
+            # that ignores it - no inlier-count games
+            score = -sum(min(res(f, p), 0.3) for p in pts)
+            if best is None or score > best[0]:
+                best = (score, f)
+        return best[1] if best is not None else fit
+
+    def _fit_ok(self, fit, strict=True):
+        # strict: the final gate (polish). loose: round steering - a
+        # glitch-starved 5-point fit still has to steer toward the apex,
+        # only flat/bowl surfaces are rejected there
+        if fit is None:
+            return False
+        if not strict:
+            return 0.35 * self.ball_r <= fit[3] <= self.ball_r + 8.
+        return (self.ball_r * self.REFF_MIN_F <= fit[3]
+                <= self.ball_r + self.REFF_MAX_ADD)
+
+    # ---------------- anchor search ----------------
+    def _top_candidates(self, cx, cy, top):
+        # top-cone presses around the hint; floor = top - DIP_TOP means
+        # only the cone of radius sqrt(2*R*DIP) ~ 3.2mm can click - side
+        # lines of foreign parts are below and never fire here. Lazy:
+        # yield the FIRST clicks and let the stencil do the rest (every
+        # extra shoulder press walks the ball a little).
+        floor = top - self.DIP_TOP
+        got = 0
+        h = self._press(cx, cy, floor, 'top')
+        if h:
+            got += 1
+            yield h
+        for rho in (2.5, 5.):
+            if got >= 2:
+                return
+            for (x, y) in self._ring(cx, cy, rho, 6 if rho < 3 else 8):
+                h = self._press(x, y, floor, 'top')
+                if h:
+                    got += 1
+                    yield h
+                    if got >= 2:
+                        return
+
+    def _ascend(self, click):
+        # starting from ANY click (usually a foreign part line): ring out
+        # with a floor just below the current line and chase anything
+        # HIGHER - the true dome top always beats every side line. No
+        # head geometry used: only "higher means closer to the top".
+        best = click
+        hops = 0
+        while hops < self.MAX_ASCEND_HOPS:
+            hops += 1
+            found = None
+            for rho in (3., 6., 10., 14., 20., 26.):
+                hits = self._ring_presses(best[0], best[1], rho,
+                                          best[2] - self.DIP_ASCEND, 'asc')
+                if hits:
+                    top = max(hits, key=lambda p: p[2])
+                    if top[2] > best[2] + 0.1:
+                        found = top
+                        break
+                    # same line again (flat plateau): its extent bounds the
+                    # ball - keep ringing outward from the original center
+            if not found:
+                return best
+            best = found
+            self.log("ascend: %.1f,%.1f Z%.2f -> %.1f,%.1f Z%.2f"
+                     % (click[0], click[1], click[2], best[0], best[1], best[2]), 2)
+        return best
+
+    def _presence(self, cx, cy, top):
+        # the hint lies badly (stale prior / moved probe): ring outward at
+        # shoulder depth until anything clicks, then chase the height.
+        # Lazy: stop the ring at the first click - the ascent plus the
+        # stencil finish the job.
+        for rho in (7., 12., 17., 22., 27., 32.):
+            for (x, y) in self._ring(cx, cy, rho,
+                                     max(8, int(math.ceil(
+                                         2. * math.pi * rho / 8.)))):
+                h = self._press(x, y, top - self.DIP_PRESENCE, 'pres')
+                if h:
+                    yield self._ascend(h)
+                    yield h
+                    return
+
+    def _cold_find(self, cx, cy):
+        # no ball_top at all: ring out at full depth (floor_z guards the
+        # probe body); ANY click localizes the ball, then chase the height.
+        for rho in (7., 12., 17., 22., 27., 32.):
+            hits = self._ring_presses(cx, cy, rho, self.floor_z, 'cold')
+            if hits:
+                top = max(hits, key=lambda p: p[2])
+                self.log("cold: first click %.1f,%.1f Z%.2f" % top, 1)
+                return top
+        return None
+
+    # ---------------- convergence ----------------
+    def _stencil(self, P, s, floor):
+        pts = []
+        h = self._press(P[0], P[1], floor, 'st')
+        if h:
+            pts.append(h)
+        miss = []
+        for (dx, dy) in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            h = self._press(P[0] + dx * s, P[1] + dy * s, floor, 'st')
+            if h:
+                pts.append(h)
+            else:
+                miss.append((P[0] + dx * s, P[1] + dy * s))
+        if miss:
+            # a stencil arm at the dome edge stops just short of the
+            # surface - give the misses one deeper chance
+            for (x, y) in miss:
+                h = self._press(x, y, floor - 0.4, 'st-')
+                if h:
+                    pts.append(h)
+        while len(pts) < 6:
+            # top up with SHORT diagonals: presses near P always click
+            # when the anchor is on the dome, keep the cloud two-sided,
+            # and stay inside the 35-degree cone (no ball nudging). Six
+            # points keep the robust fit meaningful after one glitch.
+            for (dx, dy) in ((.5, .5), (-.5, .5), (.5, -.5), (-.5, -.5)):
+                if len(pts) >= 6:
+                    break
+                h = self._press(P[0] + dx * s, P[1] + dy * s, floor, 'std')
+                if h:
+                    pts.append(h)
+            else:
+                break
+        return pts
+
+    def _converge(self, anchor, remeasure=False, top=0.):
+        # Remeasure fast path: the revision re-measures a ball whose
+        # apex height THIS SAME HEAD measured moments ago - a first
+        # click within 0.15 of that height is the apex itself (frame
+        # matches), and the Newton rounds would only press the shoulder
+        # around it. Gated by the height so a stale hint's shoulder
+        # click goes to the rounds instead; the verify ring gates what
+        # reaches the polish either way.
+        if remeasure and top and anchor[2] >= top - 0.15:
+            # remeasure: polish FIRST (nothing in the path nudges the
+            # ball, so the revision measures the exact surface state B
+            # did), verify the polished apex afterwards - a post-failure
+            # aborts the run without applying garbage
+            apex = self._measure_apex(anchor[:3], verify_first=False)
+            if apex is not None and self._verify_ring(apex):
+                return apex
+            if apex is not None:
+                self.log("remeasure: post-verify failed - treating the "
+                         "anchor as unknown", 1)
+                return None
+        # Stage 1 - Newton rounds ONCE per anchor: stencil -> paraboloid
+        # fit -> jump to the apex. Flat/bowl/too-curved surfaces (a
+        # foreign part line) never converge -> the caller tries the next
+        # anchor. The round fit P is position-only truth: glitches move
+        # it a little but the polish absorbs that.
+        # Stage 2 - verify + polish + confirm, up to twice from the SAME
+        # P: a readout glitch in the measurement data poisons one pass,
+        # and glitches do not repeat at the same spots. Retrying only
+        # stage 2 keeps the cost bounded.
+        P = anchor
+        for rnd in range(4):
+            s = self.STENCIL_S if rnd == 0 else self.STENCIL_S * 0.8
+            # floor covers the full arm drop even with P a couple mm off
+            # the apex: a missing far arm both skews the fit AND makes the
+            # press pattern one-sided (symmetric opposing presses cancel
+            # their ball nudges - one-sided ones walk the ball)
+            pts = self._stencil(P, s, P[2] - 1.3)
+            if len(pts) < 4:
+                return None
+            fit = self._fit_apex(pts)
+            if not self._fit_ok(fit, strict=False):
+                self.log("converge: surface not ball-like (reff %s)" %
+                         ("%.1f" % fit[3] if fit else "n/a"), 2)
+                return None
+            if math.dist(P[:2], fit[:2]) > 6.:
+                return None
+            P = fit
+            if math.dist(P[:2], anchor[:2]) < 0.15:
+                break
+        for _ in range(2):
+            apex = self._measure_apex(P)
+            if apex is not None:
+                return apex
+        return None
+
+    def _measure_apex(self, P, verify_first=True):
+        # Decisive dome check: the ball must CONTINUE around the apex -
+        # 4 presses on a r=3.5 ring, each exactly expect=r^2/2R below.
+        # A foreign element's edge zone carries the ball's own curvature
+        # (it passes the reff gate!) but its ring profile is flat or
+        # falls off the ball - this rejects it. Head-independent.
+        # Normally BEFORE the polish (reject cheap, and the ring's
+        # nudges land before the final measurement); the remeasure path
+        # verifies afterwards instead (see _converge).
+        if verify_first and not self._verify_ring(P):
+            self.log("converge: ring profile is not the ball top", 1)
+            return None
+        # polish: FRESH presses on one ring radius inside the contact
+        # cone (never reuse a fitted value as data). Adaptive: 8 points
+        # normally; extend to 16 when the first confirm smells like
+        # noise - the apex xy comes from symmetric z-differences, more
+        # ring points average the jitter down.
+        floor = P[2] - 1.7
+        base = self._press(P[0], P[1], floor, 'fin')
+
+        def ring_point(k):
+            # first 8: the full circle every 45 degrees; the extension
+            # interleaves at 22.5 degrees (k = 8..15)
+            a = k * math.pi / 4. if k < 8 else (2 * (k - 8) + 1) * math.pi / 8.
+            return self._press(P[0] + self.POLISH_R * math.cos(a),
+                               P[1] + self.POLISH_R * math.sin(a),
+                               floor, 'fin')
+        ring = [ring_point(k) for k in range(8)]
+        for _ in range(8):               # extension, only if needed
+            pts = ([base] if base else []) + [p for p in ring if p]
+            if len(pts) < 8:
+                return None              # most of the ring misses: not it
+            fit = self._fit_apex(pts)
+            if fit is None or not self._fit_ok(fit) \
+                    or math.dist(P[:2], fit[:2]) > 1.5:
+                return None
+            # confirm: presses at the fitted apex, median z - robust to a
+            # single readout glitch and a direct measurement of the apex
+            # height (better than the fit extrapolation)
+            zs = []
+            for _ in range(3):
+                h = self._press(fit[0], fit[1], fit[2] - 0.8, 'ok')
+                if h:
+                    zs.append(h[2])
+            if len(zs) >= 2:
+                zs.sort()
+                z = zs[1] if len(zs) == 3 else (zs[0] + zs[1]) / 2.
+                if abs(z - fit[2]) <= 0.25:
+                    return (fit[0], fit[1], z)
+            if len(ring) >= 16:
+                return None
+            self.log("polish: confirm off - extending the ring", 2)
+            ring += [ring_point(k) for k in range(8, 16)]
+        return None
+
+    def _verify_ring(self, fit):
+        # The ring radius sits INSIDE the 35-degree contact cone
+        # (R*sin35 = 2.87 for R=5): these presses never nudge the ball,
+        # so verifying cannot walk it mid-run. The drop r^2/2R still
+        # separates the dome from flat foreign lines (0 vs 0.73mm) and
+        # from edge-zone caps (profile clipped on one side).
+        r = min(2.7, self.ball_r * 0.54)
+        expect = r * r / (2. * self.ball_r)
+        floor = fit[2] - expect - 0.9
+
+        def drop(x, y):
+            h = self._press(x, y, floor, 'ver')
+            return None if h is None else fit[2] - h[2]
+
+        for (dx, dy) in ((1, 0), (0, 1)):
+            d1 = drop(fit[0] + dx * r, fit[1] + dy * r)
+            d2 = drop(fit[0] - dx * r, fit[1] - dy * r)
+            if d1 is not None and abs(d1 - expect) > 0.4:
+                d1 = drop(fit[0] + dx * r, fit[1] + dy * r)  # glitch retry
+            if d2 is not None and abs(d2 - expect) > 0.4:
+                d2 = drop(fit[0] - dx * r, fit[1] - dy * r)
+            if d1 is None or d2 is None:
+                return False
+            if abs(d1 - expect) > 0.4 or abs(d2 - expect) > 0.4:
+                return False
+        return True
+
+    # ---------------- per-head measurement ----------------
+    def _candidates(self, hint, top):
+        """Lazily yield anchor clicks, cheapest/most-likely first:
+        top-cone presses -> presence rings. A cold start first finds ANY
+        click at full depth and uses its height as a provisional top, so
+        the same chain works with zero knowledge."""
+        cold = not top
+        if cold:
+            c = self._cold_find(hint[0], hint[1])
+            if c is None:
+                return
+            self.log("cold: first click %.1f,%.1f Z%.2f - provisional top"
+                     % c, 1)
+            hint, top = c[:2], c[2] + 0.5
+        for c in self._top_candidates(hint[0], hint[1], top):
+            yield c
+        for c in self._presence(hint[0], hint[1], top):
+            yield c
+        if not cold:
+            return
+        # last resort: the neighborhood is foreign lines and a walking
+        # ball (every out-of-cone press nudges it); restart the search
+        # from a different spot with the knowledge already gathered
+        c = self._cold_find(hint[0] + 20., hint[1])
+        if c is not None:
+            yield self._ascend(c)
+            yield c
+
+    def measure(self, hint, top, tag, remeasure=False):
+        """Find and measure the ball apex for the ACTIVE head.
+        hint: (x, y) where the ball is expected (memory / prior / head)
+        top:  known ball top height, 0 = cold (no knowledge)
+        remeasure: this head measured this ball just moments ago - take
+        the first anchor straight to verify+polish (frame matches `top`)
+        Returns (x, y, z) or None."""
+        for i, c in enumerate(self._candidates(hint, top)):
+            if i >= self.MAX_CANDIDATES:
+                break
+            apex = self._converge(c, remeasure=remeasure and i == 0,
+                                  top=top)
+            if apex:
+                return apex
+            self.log("%s: anchor %d did not converge" % (tag, i + 1), 1)
+        return self._settle_measure(tag)
+
+    def _settle_measure(self, tag):
+        # Last resort for a WALKING ball: out-of-cone presses attract it,
+        # so it has been migrating toward the press cluster all run. The
+        # highest logged clicks are the best settled guesses - and a
+        # tight flower of presses INSIDE the contact cone cannot nudge
+        # the ball any further, so the surface finally holds still under
+        # the stencil. Try up to 2 spots, 2.5mm apart, highest first.
+        if not self.click_log or self.press_count > self.MAX_PRESSES - 60:
+            return None
+        spots = []
+        for c in sorted(self.click_log, key=lambda p: -p[2]):
+            if all(math.dist(c[:2], s[:2]) > 2.5 for s in spots):
+                spots.append(c)
+            if len(spots) >= 2:
+                break
+        for best in spots:
+            floor = max(best[2] - 1.5, self.floor_z)
+            pts = []
+            h = self._press(best[0], best[1], floor, 'set')
+            if h:
+                pts.append(h)
+            for k in range(8):
+                a = k * math.pi / 4.
+                h = self._press(best[0] + 2.7 * math.cos(a),
+                                best[1] + 2.7 * math.sin(a), floor, 'set')
+                if h:
+                    pts.append(h)
+            if len(pts) < 6:
+                continue
+            fit = self._fit_apex(pts)
+            if not self._fit_ok(fit) or math.dist(best[:2], fit[:2]) > 2.:
+                continue
+            self.log("%s: settle attempt at %.1f,%.1f" % (tag, *best[:2]), 1)
+            apex = self._measure_apex(fit[:3])
+            if apex is not None:
+                return apex
+        self.log("%s: settle attempts exhausted" % tag, 1)
+        return None
+
+    # ---------------- full run ----------------
+    def run(self, dry=False):
+        """Full calibration: A -> B -> revision A -> offset.
+        Returns (dx, dy, dz) in the machine frame (IDEX_VARS convention
+        verified on the real printer 2026-08-25: stored = measured as-is)."""
+        st = self.hw.state_load() or {}
+        # cold hint: where the head is NOW (the user parks it over the
+        # ball before a first run) - no search-zone config needed
+        hint = (st.get('x'), st.get('y'))
+        if hint[0] is None or hint[1] is None:
+            hint = self.hw.position()
+        top = st.get('ball_top', 0.)
+        self._travel_z = self._travel_cold
+        # ---- head A ----
+        self.log("head A: hint %.1f,%.1f  top %s" %
+                 (hint[0], hint[1], "%.1f" % top if top else "unknown"), 1)
+        apex_a = self.measure(hint, top, 'A')
+        if apex_a is None:
+            raise CoreError("Head A did not identify the ball (foreign "
+                            "contact lines keep moving it?). Re-seat the "
+                            "probe securely, park the head over it and "
+                            "rerun; if it persists, clean the nozzle.")
+        self.log("apex A: X%.3f Y%.3f Z%.3f" % apex_a, 1)
+        # self-healing ball_top: what head A just measured IS the top
+        top = apex_a[2]
+        self._travel_z = top + 3.
+        self.hw.state_save(apex_a[0], apex_a[1], top)
+        # ---- B / revision loop ----
+        # Hint signs: the stored offset IS the machine-frame measurement
+        # (apexB_cmd - apexA), so "head B's nozzle over the ball" is the
+        # command apexA + prior, and "head A there" is apexB - prior
+        # (v9 subtracted the first and its seed was systematically off
+        # by twice the offset; the second keeps the revision's search
+        # short - searches walk the ball, and walks between the B and
+        # revision polishes ARE the measurement error).
+        # The pair repeats while the offset estimate still moves by more
+        # than 0.5mm: a fresh printer (prior 0,0) walks the ball in the
+        # first pass; one redo with the fresh estimate pins both hints.
+        px, py = self.hw.prior()
+        px0, py0 = px, py
+        self.log("head B: prior %.2f,%.2f" % (px, py), 1)
+        self.hw.park(True, self._travel_z)
+        self.hw.switch_b()
+        apex_b = apex_a2 = None
+        for attempt in range(3):
+            apex_b = self.measure((apex_a[0] + px, apex_a[1] + py),
+                                  top, 'B')
+            if apex_b is None:
+                raise CoreError("Head B did not identify the ball (prior "
+                                "%.1f,%.1f was off?)." % (px, py))
+            self.log("apex B: X%.3f Y%.3f Z%.3f" % apex_b, 1)
+            self.hw.park(False, self._travel_z)
+            self.hw.switch_a()
+            apex_a2 = None
+            for _ in range(2):
+                apex_a2 = self.measure((apex_b[0] - px, apex_b[1] - py),
+                                       top, 'rev', remeasure=True)
+                if apex_a2 is not None:
+                    break
+            if apex_a2 is None:
+                raise CoreError("Revision pass A failed - cannot guarantee "
+                                "the ball did not move. Nothing was applied.")
+            self.log("apex A (revision): X%.3f Y%.3f Z%.3f" % apex_a2, 1)
+            off = (apex_b[0] - apex_a2[0], apex_b[1] - apex_a2[1])
+            if attempt == 2 or math.dist(off, (px, py)) <= 0.5:
+                break
+            if self.press_count > self.MAX_PRESSES - 150:
+                # a fresh printer's first pass rides a far-off hint and
+                # walks the ball; its raw offset is provisional. Never
+                # apply it without the confirming redo.
+                if math.hypot(px0, py0) <= 0.5:
+                    raise CoreError(
+                        "Budget ran out before the confirmation pass - the "
+                        "offset was NOT applied. Rerun the calibration.")
+                break
+            self.log("offset estimate still moving (%.2f,%.2f -> %.2f,%.2f)"
+                     " - one more pass" % (px, py, off[0], off[1]), 1)
+            px, py = off
+            self.hw.park(True, self._travel_z)
+            self.hw.switch_b()
+        # Drift guard. Only motion BETWEEN head B's polish and the
+        # revision's polish corrupts the offset (before that, the fresh
+        # hints re-measure the moved ball). The revision remeasured the
+        # same surface B did: mapping B's apex back through the prior
+        # must land on the revision's apex. Ball walks during searches
+        # and a bump at the head switch are legal and cancel here.
+        if math.hypot(px, py) > 0.5:
+            gap = math.dist((apex_b[0] - px, apex_b[1] - py),
+                            apex_a2[:2])
+            if gap > 1.4:
+                raise CoreError(
+                    "Ball moved %.2fmm between the B and revision passes - "
+                    "measurement invalid. Secure the probe and rerun. "
+                    "Nothing was applied." % gap)
+            if gap > 0.7:
+                self.log("revision disagrees with B by %.2fmm (prior error? "
+                         "walk?)" % gap, 0)
+        if math.hypot(px, py) <= 0.5 \
+                and math.dist(apex_a[:2], apex_a2[:2]) > 3.5:
+            # no usable prior to map through (fresh printer): fall back
+            # to a coarse total-walk check; the fresh hints already
+            # tolerate most walks, so only flag the extreme ones
+            raise CoreError("Ball moved %.2fmm during the run - measurement "
+                            "invalid. Secure the probe and rerun. Nothing "
+                            "was applied."
+                            % math.dist(apex_a[:2], apex_a2[:2]))
+        self.hw.state_save(apex_a2[0], apex_a2[1], apex_a2[2])
+        off = (apex_b[0] - apex_a2[0], apex_b[1] - apex_a2[1],
+               apex_b[2] - apex_a2[2])
+        self.log("MEASURED (machine frame): dX%.3f dY%.3f dZ%.3f" % off, 1)
+        if abs(off[0]) > 15. or abs(off[1]) > 15. or abs(off[2]) > 5.:
+            raise CoreError("Measured dX%.2f dY%.2f dZ%.2f is outside the "
+                            "plausible range (+/-15 XY, +/-5 Z) - the ball "
+                            "was knocked or the switch glitched. Nothing was "
+                            "applied." % off)
+        if dry:
+            self.log("DRY_RUN: offsets not applied", 1)
+        return off
+
+
+# =====================================================================
+#  Klipper adapter
+# =====================================================================
 
 class ToolOffsetSphere:
     def __init__(self, config):
@@ -27,55 +675,35 @@ class ToolOffsetSphere:
         pin_params = ppins.lookup_pin(pin, can_invert=True, can_pullup=True)
         self.mcu_endstop = pin_params['chip'].setup_pin('endstop', pin_params)
         self.reactor = self.printer.get_reactor()
+        # physical config - deliberately tiny (see ANALYSIS.md)
         self.ball_r = config.getfloat('ball_radius', 5., above=1.)
-        self.ball_top = config.getfloat('ball_top', 0., minval=0.)
         self.floor_z = config.getfloat('floor_z', 38., above=0.)
-        self.safe_z_cold = config.getfloat('safe_z_cold', 58., above=10.)
+        self.edge = config.getfloat('edge_margin', 15., minval=0.)
         self.probe_speed = config.getfloat('probe_speed', 4., above=0.)
         self.travel_speed = config.getfloat('travel_speed', 80., above=0.)
         self.lift_speed = config.getfloat('lift_speed', 15., above=0.)
-        self.cx = config.getfloat('search_center_x', 165.)
-        self.cy = config.getfloat('search_center_y', 35.)
-        self.sx = config.getfloat('search_size_x', 160., above=20.)
-        self.sy = config.getfloat('search_size_y', 120., above=20.)
+        self.travel_cold_z = config.getfloat('travel_z_cold', 58., above=10.)
         self.log_level = config.getint('log_level', 1, minval=0, maxval=2)
-        self.climb_budget = config.getint('climb_budget', 350, minval=10)
-        self.max_off_xy = config.getfloat('max_offset_xy', 15., above=1.)
-        self.max_off_z = config.getfloat('max_offset_z', 5., above=0.5)
-        self.y_margin = config.getfloat('y_margin', 15., above=0.)
-        self.nozzle_tip_r = config.getfloat('nozzle_tip_r', 0.4, minval=0.)
-        self.tap_foreign_z = config.getfloat('tap_foreign_z', 1.5, above=0.)
-        def _hops(key, default):
-            out = []
-            for tok in config.get(key, default).split():
-                dx, dy = [float(v) for v in tok.split(',')]
-                out.append((dx, dy))
-            return out
-        # offsets of head parts that hang beside/below the nozzle and can
-        # click first (vostok: the L cool duct at -26mm on A, +10,+14 on B)
-        self.tap_hops_a = _hops('tap_hops_a', '-26,0')
-        import os
-        self._ballpos_path = os.path.join(
-            os.path.dirname(os.path.realpath(__file__)), '.ball-pos.json')
-        self.tap_hops_b = _hops('tap_hops_b', '10,14')
-        self.esc_offsets = []
-        for tok in config.get('escape_offsets', '-15,0 15,0').split():
-            dx, dy = [float(v) for v in tok.split(',')]
-            self.esc_offsets.append((dx, dy))
-        # plain T1/T0: fine when the head-B lane is preloaded (a filament
-        # change at switch time would knock the ball off)
+        # legacy seed: used once, then the state file owns the value
+        self._seed_top = config.getfloat('ball_top', 0., minval=0.)
         self.switch_b = config.get('head_switch_b_gcode', 'T1')
         self.switch_a = config.get('head_switch_a_gcode', 'T0')
-        # axis bounds and auto parking (filled at run start)
         self.bounds = None
+        self._trace_path = '/tmp/bp_trace.log'
+        # state file next to the module copy in the config dir
+        self._state_path = os.path.join(
+            os.path.dirname(os.path.realpath(__file__)), '.ball-state.json')
+        self._oldpos_path = os.path.join(
+            os.path.dirname(os.path.realpath(__file__)), '.ball-pos.json')
         # homing_move computes the halt position from the steppers attached
-        # to the endstop; without any it returns the start position and the
-        # trigger arming misbehaves. Attach the Z rails (the probing axis)
-        # plus the IDEX primary X rail, like the old tools_calibrate did.
+        # to the endstop; attach the Z rails only (probing axis) - X/Y
+        # steppers never move during a vertical press and would trip
+        # check_no_movement() on every probe.
         self.printer.register_event_handler("klippy:connect",
                                             self._handle_connect)
         self.printer.register_event_handler("klippy:ready",
                                             self._handle_connect)
+
     def _handle_connect(self, eventtime=None):
         if getattr(self, '_steppers_attached', False):
             return
@@ -84,10 +712,6 @@ class ToolOffsetSphere:
         except Exception:
             return
         for st in kin.get_steppers():
-            # Z rails ONLY: probing_move's check_no_movement() requires every
-            # registered stepper to move during the probe - a vertical
-            # descent never moves X, so attaching stepper_x turns EVERY
-            # probe into "Probe triggered prior to movement"
             if st.get_name().startswith('stepper_z'):
                 self.mcu_endstop.add_stepper(st)
         self._steppers_attached = True
@@ -99,63 +723,82 @@ class ToolOffsetSphere:
                                     desc="Shake each axis and count probe flickers")
         self.gcode.register_command('TOOL_SPHERE_PROBE_TEST', self.cmd_probetest,
                                     desc="One probing_move down + up, with pin states")
-    # ---------------- helpers ----------------
+
+    # ---------------- misc helpers ----------------
     def _log(self, msg, level=1):
         if level > self.log_level:
             return
         prefix = {0: '!!', 1: '//', 2: '##'}[min(level, 2)]
         self.gcode.respond_raw("%s %s" % (prefix, msg))
+
+    def _trace(self, msg):
+        try:
+            with open(self._trace_path, 'a') as f:
+                f.write('%.3f %s\n' % (self.reactor.monotonic(), msg))
+        except Exception:
+            pass
+
     def _toolhead(self):
         return self.printer.lookup_object('toolhead')
+
     def _pos(self):
         return self._toolhead().get_position()
-    def _move(self, x, y, z, speed):
-        # machine coordinates of the active head carriage
-        self._toolhead().manual_move([x, y, z], speed)
-    def _safe_z(self, ball_top):
-        return (ball_top + 2.5) if ball_top else self.safe_z_cold
-    def _bounds(self):
-        # axis bounds, filled lazily (any command can run first)
+
+    def _get_bounds(self):
         if self.bounds is None:
             kin = self._toolhead().get_kinematics().get_status(
                 self.reactor.monotonic())
             self.bounds = (kin['axis_minimum'][0], kin['axis_maximum'][0],
                            kin['axis_minimum'][1], kin['axis_maximum'][1])
         return self.bounds
-    def _park(self, left):
-        b = self._bounds()
-        x = (b[0] + 10.) if left else (b[1] - 10.)
-        return x
-    def _probe_down(self, x, y, safe_z, tag='', floor=None):
-        # 3-phase travel + descent to floor_z (or a custom floor for the
-        # depth-limited tap presses), stop on click.
-        # Returns (x, y, click_z) or None (miss)
-        fl = self.floor_z if floor is None else floor
+
+    def _state_load(self):
+        try:
+            return json.load(open(self._state_path))
+        except Exception:
+            pass
+        # one-time migration from v9 artifacts
+        st = {}
+        try:
+            old = json.load(open(self._oldpos_path))
+            st['x'], st['y'] = old['x'], old['y']
+        except Exception:
+            pass
+        if self._seed_top:
+            st['ball_top'] = self._seed_top
+        return st or None
+
+    def _state_save(self, x, y, top):
+        try:
+            json.dump({'x': round(x, 3), 'y': round(y, 3),
+                       'ball_top': round(top, 3)},
+                      open(self._state_path, 'w'))
+        except Exception:
+            pass
+
+    # ---------------- hardware interface for the core ----------------
+    def press(self, x, y, floor, travel_z):
+        # 3-phase press: lift/travel (never descend while moving XY),
+        # settle, wait for the lever to release, depth-limited descent.
+        # Returns (x, y, click_z) or None.
+        self._trace("press %.2f,%.2f floor=%.2f tz=%.2f" % (x, y, floor, travel_z))
         pos = self._pos()
-        if pos[2] < safe_z - .01:
-            self._move(pos[0], pos[1], safe_z, self.lift_speed)
-        # travel at the CURRENT height if it is higher (e.g. the T1 macro's
-        # z-hop) - never descend while moving XY: head B's nozzle sits
-        # lower than A's by an unknown dZ and could plane through the ball
-        tz = max(pos[2], safe_z)
-        self._move(x, y, tz, self.travel_speed)
-        if tz > safe_z + .01:
-            self._move(x, y, safe_z, self.lift_speed)
-        # settle: the ball lever rings for a few hundred ms after ANY move;
-        # arming the endstop mid-ring latches a false instant trigger
-        # ("Probe triggered prior to movement"). Let it decay first.
-        self._toolhead().dwell(0.4)
-        # wait for the lever to swing back after the previous click (the
-        # real ball switch returns slowly); only a stuck pin is an error
-        _th = self._toolhead()
-        _released = False
+        if pos[2] < travel_z - .01:
+            self._toolhead().manual_move([pos[0], pos[1], travel_z],
+                                         self.lift_speed)
+        tz = max(pos[2], travel_z)
+        self._toolhead().manual_move([x, y, tz], self.travel_speed)
+        if tz > travel_z + .01:
+            self._toolhead().manual_move([x, y, travel_z], self.lift_speed)
+        # settle: the ball lever rings after any move; arming mid-ring
+        # latches a false "triggered prior to movement"
+        th = self._toolhead()
+        th.dwell(0.4)
         for _ in range(20):
-            _th.dwell(0.1)
-            if not self.mcu_endstop.query_endstop(
-                    _th.get_last_move_time()):
-                _released = True
+            th.dwell(0.1)
+            if not self.mcu_endstop.query_endstop(th.get_last_move_time()):
                 break
-        if not _released:
+        else:
             raise self.printer.command_error(
                 "ball probe reports TRIGGERED before the descent (pressed, "
                 "jammed or wrong polarity) - check the switch")
@@ -163,833 +806,95 @@ class ToolOffsetSphere:
         attempts = 3
         while True:
             try:
-                tpos = [x, y, fl]
-                epos = phoming.probing_move(self.mcu_endstop, tpos,
+                epos = phoming.probing_move(self.mcu_endstop, [x, y, floor],
                                             self.probe_speed)
                 break
             except self.printer.command_error as e:
                 reason = str(e)
                 if "No trigger" in reason:
-                    # clean miss - the descent completed without a click
-                    self._log(". miss %s(%.1f,%.1f)" % (tag, x, y), 2)
                     return None
                 if "prior to movement" in reason and attempts > 0:
-                    # the lever has not swung back yet (or a bounce): wait
-                    # for a stable open state up to 2s, then retry
                     attempts -= 1
-                    toolhead = self._toolhead()
                     ok = False
                     for _ in range(20):
-                        toolhead.dwell(0.1)
+                        th.dwell(0.1)
                         if not self.mcu_endstop.query_endstop(
-                                toolhead.get_last_move_time()):
+                                th.get_last_move_time()):
                             ok = True
                             break
                     if ok:
-                        self._log("probe still pressed after the click - "
-                                  "waited for release, retrying (%d left)"
-                                  % attempts)
                         continue
                 raise self.printer.command_error(reason)
         z = epos[2]
-        if z <= fl + 0.01:
-            self._log(". miss %s(%.1f,%.1f)" % (tag, x, y), 2)
+        if z <= floor + 0.01:
             return None
-        if z >= safe_z - 0.2:
-            # triggered right at the travel height: the switch is not on the
-            # ball - noise or a knocked-off/unplugged probe. Never treat as
-            # a ball contact (it used to poison the whole calibration).
-            # NOTE: only a hair below the travel height is impossible - head
-            # B presses in its own frame and its dZ (a few mm) is legitimate
-            self._log("!! probe triggered at travel height %.1f (%s) - "
-                      "switch noise or the ball probe is off the bed" % (z, tag), 0)
+        if z >= travel_z - 0.2:
+            # triggered at the travel height: switch noise or the probe is
+            # off the bed - never a ball contact
+            self._log("!! probe triggered at travel height %.1f - noise or "
+                      "missing probe" % z, 0)
             return None
-        # real click: give the ball lever time to swing back before the
-        # next probe arms (else the next start sees the pin still pressed)
-        self._toolhead().dwell(0.4)
+        th.dwell(0.4)   # let the lever swing back before the next press
+        self._trace("click %.2f,%.2f z=%.3f" % (x, y, z))
         return (x, y, z)
-    # ---------------- sphere math ----------------
-    def _fit_sphere(self, pts):
-        n = len(pts)
-        if n < 4:
-            return None
-        M = [[0.]*5 for _ in range(4)]
-        for p in pts:
-            x, y, z = p
-            row = [2*x, 2*y, 2*z, 1.]
-            for i in range(4):
-                for j in range(4):
-                    M[i][j] += row[i]*row[j]
-                M[i][4] += row[i]*(x*x + y*y + z*z)
-        for col in range(4):
-            piv = col
-            for r2 in range(col+1, 4):
-                if abs(M[r2][col]) > abs(M[piv][col]):
-                    piv = r2
-            M[col], M[piv] = M[piv], M[col]
-            if abs(M[col][col]) < 1e-9:
-                return None
-            for r2 in range(col+1, 4):
-                f = M[r2][col]/M[col][col]
-                for c2 in range(col, 5):
-                    M[r2][c2] -= f*M[col][c2]
-        sol = [0.]*4
-        for r2 in range(3, -1, -1):
-            s = M[r2][4]
-            for c2 in range(r2+1, 4):
-                s -= M[r2][c2]*sol[c2]
-            sol[r2] = s/M[r2][r2]
-        cx, cy, cz, c = sol
-        r2 = c + cx*cx + cy*cy + cz*cz
-        if r2 <= 0:
-            return None
-        return (cx, cy, cz, math.sqrt(r2))
-    def _ransac_sphere(self, pts):
-        import random
-        rng = random.Random()
-        if len(pts) < 4:
-            return None
-        lo, hi = self.ball_r - .6, self.ball_r + .6
-        best_set, best_cnt = None, -1
-        for _ in range(80):
-            idx = rng.sample(range(len(pts)), 4)
-            f = self._fit_sphere([pts[i] for i in idx])
-            if f is None or not (lo <= f[3] <= hi):
-                continue
-            cx, cy, cz, r = f
-            inl = [p for p in pts
-                   if abs(math.dist(p, (cx, cy, cz)) - r) < 0.2]
-            if len(inl) > best_cnt:
-                best_cnt, best_set = len(inl), inl
-        if best_set and len(best_set) >= 4:
-            return self._fit_sphere(best_set)
-        return self._fit_sphere(pts)
-    # ---------------- algorithm phases ----------------
-    def _scan_pitches(self):
-        # Multi-resolution blind scan, NO head geometry assumptions.
-        # Pass 1 assumes a typical heater block listens wide (fast); the last
-        # pass is nozzle-only and is GUARANTEED for any head: worst grid-node
-        # to ball offset = pitch/sqrt(2) <= nozzle hearing radius (R + 0.5).
-        r = self.ball_r
-        sched = [min(20., math.floor((12. + r) * 1.35)),   # typical block
-                 min(15., math.floor((6. + r) * 1.35)),    # sock-sized
-                 max(6., math.floor((r + 0.5) * 1.35))]    # nozzle-only
-        out = []
-        for p in sched:
-            if not out or p < out[-1] - .5:
-                out.append(p)
-        return out
-    def _scan(self, ball_top):
-        safe = self._safe_z(ball_top)
-        x0 = self.cx - self.sx/2.; x1 = self.cx + self.sx/2.
-        y0 = self.cy - self.sy/2.; y1 = self.cy + self.sy/2.
-        # clamp the search rectangle to the machine's own axis bounds -
-        # an out-of-range grid point would abort the whole run
-        if self.bounds:
-            x0 = max(x0, self.bounds[0] + 2.); x1 = min(x1, self.bounds[1] - 2.)
-            y0 = max(y0, self.bounds[2] + self.y_margin)
-            y1 = min(y1, self.bounds[3] - self.y_margin)
-        pitches = self._scan_pitches()
-        for pi, pitch in enumerate(pitches):
-            xs, ys = [], []
-            x = x0
-            while x <= x1 + .01:
-                xs.append(x); x += pitch
-            y = y0
-            while y <= y1 + .01:
-                ys.append(y); y += pitch
-            ys.sort(key=lambda v: abs(v - self.cy))
-            pts = []
-            flip = self.cx > (xs[0] + xs[-1])/2.
-            for ry in ys:
-                row = xs[:] if not flip else xs[::-1]
-                for rx in row:
-                    pts.append((rx, ry))
-                flip = not flip
-            self._log("blind search pass %d/%d: grid %.0fmm, %d points"
-                      % (pi + 1, len(pitches), pitch, len(pts)))
-            for (x, y) in pts:
-                hit = self._probe_down(x, y, safe, 'scan')
-                if hit:
-                    return hit
-        return None
-    def _climb(self, best, ball_top):
-        # hill-climb by click height + escape rings + jumps.
-        # Returns the best click (x, y, z) and nozzle-point samples for the fit
-        samples = []
-        cur = best; d = 4.
-        clicks = 0
-        safe = self._safe_z(ball_top)
-        xmin, xmax, ymin, ymax = self.bounds[0], self.bounds[1], self.bounds[2], self.bounds[3]
-        clx = lambda v: max(xmin, min(xmax, v))
-        cly = lambda v: max(ymin + self.y_margin,
-                             min(ymax - self.y_margin, v))
-        while True:
-            if clicks >= self.climb_budget:
-                self._log("climb budget (%d clicks) reached - settling on "
-                          "the best click (a real ball settles slightly "
-                          "between presses, so the climb self-terminates)"
-                          % self.climb_budget, 0)
-                break
-            if clicks and clicks % 25 == 0:
-                self._log("climb: %d clicks, best Z%.2f at %.1f,%.1f"
-                          % (clicks, cur[2], cur[0], cur[1]))
-            probes = []
-            for (dx, dy) in ((1,0),(-1,0),(0,1),(0,-1)):
-                clicks += 1
-                hit = self._probe_down(clx(cur[0]+dx*d), cly(cur[1]+dy*d), safe, 'climb')
-                if hit:
-                    samples.append(hit); probes.append(hit)
-            up = None
-            for h in probes:
-                if h[2] > cur[2] + 0.03 and (up is None or h[2] > up[2]):
-                    up = h
-            if up:
-                cur = up; d = min(4., d*1.5); continue
-            top = max(probes, key=lambda h: h[2]) if probes else None
-            eq = any(abs(h[2]-cur[2]) <= 0.03 for h in probes)
-            if eq and top and top[2] >= cur[2] - 0.01:
-                # apex plateau: equal clicks - go straight to sphere rings
-                return cur, samples
-            if not eq and d > 0.7:
-                d /= 2.; continue
-            # escape rings (early exit on the first good click)
-            escaped = None
-            for rr in (5., 9., 14., 20.):
-                for k in range(8):
-                    a = k/8.*2.*math.pi
-                    clicks += 1
-                    hit = self._probe_down(clx(cur[0]+rr*math.cos(a)),
-                                           cly(cur[1]+rr*math.sin(a)), safe, 'ring')
-                    if hit:
-                        samples.append(hit)
-                        if hit[2] > cur[2] + 0.3:
-                            escaped = hit; break
-                if escaped: break
-            if escaped:
-                cur = escaped; d = 4.; continue
-            # jumps along element offsets (known head geometry)
-            jumped = None
-            for (dx, dy) in self.esc_offsets:
-                clicks += 1
-                hit = self._probe_down(clx(cur[0]+dx), cly(cur[1]+dy), safe, 'jump')
-                if hit and hit[2] > cur[2] - 1.0:
-                    samples.append(hit); jumped = hit; break
-            if jumped:
-                cur = jumped; d = 2.; continue
-            return cur, samples
-    def _rings(self, center, ball_top, radii):
-        samples = []
-        safe = self._safe_z(ball_top)
-        for rr in radii:
-            for k in range(6):
-                a = k/6.*2.*math.pi + (math.pi/6. if rr > 3. else 0.)
-                hit = self._probe_down(center[0]+rr*math.cos(a),
-                                       center[1]+rr*math.sin(a), safe, 'sphere')
-                if hit:
-                    samples.append(hit)
-        return samples
-    def _seed_b(self, apex, ball_top):
-        # Find the ball again with head B. B's nozzle offset is exactly what
-        # we are calibrating, so do NOT press at A's apex directly and do NOT
-        # travel at the tight A-margin: scan a small serpentine around the
-        # apex at a tall margin (B's dZ is unknown), vertical descents only.
-        # The first click seeds the climb, which refines from there.
-        safe_hi = ball_top + 8.
-        self._log("head B: local scan around apex A (tall margin Z%.1f)"
-                  % safe_hi)
-        pitch = 10.
-        pts = []
-        for iy, dy in enumerate((20., 10., 0., -10., -20.)):
-            row = (-20., -10., 0., 10., 20.)
-            if iy % 2:
-                row = row[::-1]
-            for dx in row:
-                pts.append((apex[0] + dx, apex[1] + dy))
-        for (x, y) in pts:
-            seed = self._probe_down(x, y, safe_hi, 'Bscan')
-            if seed:
-                self._log("head B: first click at %.1f,%.1f (Z%.2f)"
-                          % seed)
-                return seed
-        return None
-    def _measure(self, seed_hit, ball_top):
-        # climb -> rings -> fit -> verify. Returns the apex (x,y,z)
-        best, samples = self._climb(seed_hit, ball_top)
-        R = self.ball_r
-        def try_fit(pts):
-            f = self._ransac_sphere(pts)
-            if f and R-.6 <= f[3] <= R+.6:
-                return f
-            return None
-        all_pts = samples[:]
-        fit = None; fittry = 0; vretry = 0
-        for radii in ((R*.52, R*.86), (R*.3, R*.64, R)):
-            all_pts += self._rings(best, ball_top, radii)
-            fit = try_fit(all_pts)
-            if fit or fittry:
-                break
-            fittry += 1
-        if fit:
-            cx, cy, cz, r = fit
-            top = cz + r
-            # verify: a click at the center must match the sphere top
-            # (a wire glitch is not a mismatch - just repeat the press)
-            v = None
-            for _ in range(3):
-                v = self._probe_down(cx, cy, self._safe_z(ball_top), 'verify')
-                if v:
-                    break
-            if v and abs(v[2] - top) <= 0.15:
-                self._log("verify: Z%.2f = sphere %.2f - ok" % (v[2], top))
-                return (cx, cy, top)
-            if vretry < 2:
-                vretry += 1
-                all_pts += self._rings((cx, cy), ball_top, (R*.3, R*.64, R))
-                fit = try_fit(all_pts)
-                if fit:
-                    cx, cy, cz, r = fit
-                    v2 = self._probe_down(cx, cy, self._safe_z(ball_top), 'verify2')
-                    if v2 and abs(v2[2] - (cz+r)) <= 0.15:
-                        return (cx, cy, cz + r)
-        self._log("sphere fit did not converge - using best click", 0)
-        return best
-    # ---------------- tap mode (v9): top-only presses ----------------
-    def _tap_press(self, x, y, floor, travel, tag):
-        return self._probe_down(x, y, travel, tag, floor=floor)
 
-    def _tap_measure(self, cx, cy, span, pitch, dips, ball_top, hops, tag):
-        # Depth-limited search: outside the dip cone the nozzle cannot
-        # touch the ball at all, so off-apex grid points miss cleanly.
-        # Returns the refined apex (x, y, z) or None.
-        R = self.ball_r
-        travel = ball_top + 3.
-        cap = ball_top + self.tap_foreign_z
-        seed = None
-        for dip in dips:
-            floor = ball_top - dip
-            found = False
-            for gy in range(span, -span - 1, -pitch):
-                for gx in range(-span, span + 1, pitch):
-                    hit = self._tap_press(cx + gx, cy + gy, floor, travel, tag)
-                    if not hit:
-                        continue
-                    if hit[2] > cap and hops:
-                        # a part beside the nozzle clicked (the cool duct):
-                        # the ball is under IT - hop the nozzle there
-                        for (hx, hy) in hops:
-                            h2 = self._tap_press(hit[0] + hx, hit[1] + hy,
-                                                 floor, travel, tag + 'hop')
-                            if h2 and h2[2] <= cap:
-                                hit = h2
-                                break
-                        else:
-                            continue
-                    seed = hit
-                    found = True
-                    break
-                if found:
-                    break
-            if seed:
-                break
-        if not seed:
-            return None
-        # hill climb by click height (all presses depth-limited)
-        cur = seed
-        d = 2.
-        clicks = 0
-        floor = ball_top - dips[-1] if False else ball_top - 0.9
-        # climb at the SHALLOWEST floor that still contacts near the apex
-        floor = cur[2] + 0.05 - 0.9  # ~top-0.85 relative to this head
-        while clicks < 120:
-            up = None
-            for (dx, dy) in ((1,0),(-1,0),(0,1),(0,-1)):
-                clicks += 1
-                hit = self._tap_press(cur[0] + dx*d, cur[1] + dy*d,
-                                      floor, travel, tag)
-                if hit and hit[2] > cur[2] + 0.01 and (up is None or hit[2] > up[2]):
-                    up = hit
-            if up:
-                cur = up
-                continue
-            if d > 0.5:
-                d /= 2.
-                continue
-            break
-        # parabola refine over the flat top: z = top - u^2/2R; with a flat
-        # nozzle tip (r) the effective base is (sp - r). Two iterations.
-        sp = 1.5
-        for _ in range(2):
-            rx1 = self._tap_press(cur[0] + sp, cur[1], floor, travel, tag)
-            rx2 = self._tap_press(cur[0] - sp, cur[1], floor, travel, tag)
-            ry1 = self._tap_press(cur[0], cur[1] + sp, floor, travel, tag)
-            ry2 = self._tap_press(cur[0], cur[1] - sp, floor, travel, tag)
-            ex = ey = 0.
-            if rx1 and rx2:
-                ex = (rx1[2] - rx2[2]) * R / (2. * max(0.5, sp - self.nozzle_tip_r))
-            if ry1 and ry2:
-                ey = (ry1[2] - ry2[2]) * R / (2. * max(0.5, sp - self.nozzle_tip_r))
-            if abs(ex) > 1.5: ex = 0.
-            if abs(ey) > 1.5: ey = 0.
-            cur = (cur[0] + ex, cur[1] + ey, cur[2])
-        ap = self._tap_press(cur[0], cur[1], floor, travel, tag)
-        apex = (cur[0], cur[1], ap[2]) if ap else cur
-        # Decisive nozzle check: the ball must continue around the apex
-        # (see _tap_verify). A protruding part fails it - hop the nozzle
-        # to where that part touched the ball and measure again (one hop
-        # level deep, no loops).
-        if not self._tap_verify(apex, ball_top, tag):
-            # known part offsets first (fast, precise)
-            for (hx, hy) in hops:
-                retry = self._tap_measure(apex[0] + hx, apex[1] + hy,
-                                          4, 2, dips, ball_top, [],
-                                          tag + 'hop')
-                if retry and self._tap_verify(retry, ball_top, tag + 'v2'):
-                    return retry
-            # unknown part: map the neighborhood and re-measure from the
-            # highest flat contact (the ball top line)
-            safe = self.safe_z_cold
-            pts = {}
-            for gy2 in (-15, -10, -5, 0, 5, 10, 15):
-                for gx2 in (-15, -10, -5, 0, 5, 10, 15):
-                    h3 = self._probe_down(apex[0] + gx2, apex[1] + gy2,
-                                          safe, tag + 'map')
-                    if h3:
-                        pts[(gx2, gy2)] = h3[2]
-                        self._log("%s map %+d,%+d: %.2f"
-                                  % (tag, gx2, gy2, h3[2]), 1)
-            best = None
-            for (px, py), pz in pts.items():
-                for (qx, qy) in ((5,0),(-5,0),(0,5),(0,-5)):
-                    nb = pts.get((px+qx, py+qy))
-                    if nb is not None and abs(nb - pz) <= 0.6:
-                        if best is None or pz > best[2]:
-                            best = (apex[0] + px, apex[1] + py, pz)
-                        break
-            if best:
-                retry = self._tap_measure(best[0], best[1], 4, 2,
-                                          dips, ball_top, [], tag + 'map2')
-                if retry and self._tap_verify(retry, ball_top, tag + 'v3'):
-                    return retry
-            self._log("%s: could NOT verify the nozzle touched the ball "
-                      "- refusing to report a foreign contact" % tag, 0)
-            return None
-        return apex
+    def _hw(self):
+        adapter = self
 
-    def _tap_verify(self, apex, ball_top, tag):
-        # Is the apex really the NOZZLE on the ball top?
-        # The nozzle is the only head part at offset (0,0): if the apex was
-        # measured with it, the ball continues around - 4 presses on a
-        # r=3.5mm ring must all click at z0 - r^2/2R. A protruding part
-        # sits (dx,dy) away from the nozzle: its "apex" is the ball center
-        # seen through the part, and a ring around it is off the ball on
-        # every side - all presses miss. (Climb alone cannot tell them
-        # apart: a part hanging below the nozzle reads HIGHER, and the
-        # climb chases the highest click.)
-        R = self.ball_r
-        r = min(3.5, R * 0.7)
-        expect = r * r / (2. * R)
-        floor = apex[2] - expect - 1.0
-        travel = ball_top + 3.
-        for (dx, dy) in ((1,0),(-1,0),(0,1),(0,-1)):
-            h = self._tap_press(apex[0] + dx*r, apex[1] + dy*r,
-                                floor, travel, tag + 'verify')
-            if not h:
-                self._log("verify MISS at %+0.1f,%+0.1f - the apex was a "
-                          "protruding part, not the nozzle" % (dx*r, dy*r), 1)
-                return False
-            if abs((apex[2] - h[2]) - expect) > 0.45:
-                self._log("verify height off by %.2f at %+0.1f,%+0.1f"
-                          % (abs((apex[2] - h[2]) - expect), dx*r, dy*r), 1)
-                return False
-        self._log("verify OK: ball surface confirmed on all 4 sides", 1)
-        return True
+        class HW:
+            def press(hw, x, y, floor, travel_z):
+                return adapter.press(x, y, floor, travel_z)
+            def park(hw, left, z):
+                pos = adapter._pos()
+                adapter._toolhead().manual_move([pos[0], pos[1], z],
+                                                adapter.lift_speed)
+                b = adapter._get_bounds()
+                px = (b[0] + 10.) if left else (b[1] - 10.)
+                adapter._toolhead().manual_move([px, pos[1], z],
+                                                adapter.travel_speed)
+            def switch_b(hw):
+                adapter.gcode.run_script_from_command(adapter.switch_b)
+            def switch_a(hw):
+                adapter.gcode.run_script_from_command(adapter.switch_a)
+            def prior(hw):
+                try:
+                    iv = adapter.printer.lookup_object('gcode_macro IDEX_VARS')
+                    st = iv.get_status(adapter.reactor.monotonic())
+                    return (st.get('offset_x', 0.), st.get('offset_y', 0.))
+                except Exception:
+                    return (0., 0.)
+            def position(hw):
+                p = adapter._pos()
+                return (p[0], p[1])
+            def state_load(hw):
+                return adapter._state_load()
+            def state_save(hw, x, y, top):
+                adapter._state_save(x, y, top)
+        return HW()
 
-    def _tap_discover(self, gcmd):
-        # One-time ball_top discovery: a 3x3 grid of deep presses around
-        # the configured search center finds the ball, then a short hill
-        # climb walks to the APEX - the first grid contact is usually on
-        # the shoulder, 2-3mm BELOW the top, and a shoulder height would
-        # poison every depth-limited press that follows.
-        # blind search over the full configured zone (same as sphere mode)
-        # - the probe is placed "roughly" in the zone, not at the exact center
-        hit = self._scan(0)
-        if not hit:
-            raise gcmd.error("Ball not found in the scan zone (center X%.0f "
-                             "Y%.0f, %.0fx%.0fmm) - move the probe there or "
-                             "widen search_size_x/y"
-                             % (self.cx, self.cy, self.sx, self.sy))
-        cur = hit
-        d = 2.
-        safe = self.safe_z_cold
-        for _ in range(12):
-            up = None
-            for (dx, dy) in ((1,0),(-1,0),(0,1),(0,-1)):
-                h = self._probe_down(cur[0] + dx*d, cur[1] + dy*d, safe,
-                                     'discover+')
-                if h and h[2] > cur[2] + 0.05 and (up is None or h[2] > up[2]):
-                    up = h
-            if up:
-                cur = up
-                continue
-            if d > 0.5:
-                d /= 2.
-                continue
-            break
-        # The climb always chases the HIGHEST click - if the first contact
-        # was a part hanging beside the nozzle (the cool duct, ball_top +
-        # its hang), the climb locked onto that foreign line. Hop the nozzle
-        # to where that part touched: if the ball's true top is LOWER, the
-        # foreign line was real - re-climb from the true contact.
-        for (hx, hy) in self.tap_hops_a:
-            h2 = self._probe_down(cur[0] + hx, cur[1] + hy, safe, 'discover+')
-            self._log("discovery hop %+0.f,%+0.f from %.1f,%.1f: %s"
-                      % (hx, hy, cur[0], cur[1],
-                         "miss" if not h2 else "%.2f at %.1f,%.1f"
-                         % (h2[2], h2[0], h2[1])), 1)
-            if not h2:
-                # hop missed: the climb locked onto some other part. Map the
-                # neighborhood - one run tells us every contact line (ball,
-                # duct, shroud) and we seed the re-climb from the lowest
-                # local apex (the nozzle line is always the lowest)
-                # contact map; the ball's top is the highest NON-spike
-                # point (the switch stalk reads higher but is a lone spike:
-                # its neighbors drop > 0.6mm; the ball top is a flat line)
-                pts = {}
-                for gy2 in (-15, -10, -5, 0, 5, 10, 15):
-                    for gx2 in (-15, -10, -5, 0, 5, 10, 15):
-                        h3 = self._probe_down(cur[0] + gx2, cur[1] + gy2,
-                                              safe, 'map')
-                        if h3:
-                            pts[(gx2, gy2)] = h3[2]
-                            self._log("map %+d,%+d: %.2f" % (gx2, gy2, h3[2]), 1)
-                best = None
-                for (px, py), pz in pts.items():
-                    for (qx, qy) in ((5,0),(-5,0),(0,5),(0,-5)):
-                        nb = pts.get((px+qx, py+qy))
-                        if nb is not None and abs(nb - pz) <= 0.6:
-                            if best is None or pz > best[2]:
-                                best = (cur[0] + px, cur[1] + py, pz)
-                            break
-                if best and best[2] < cur[2] - 0.5:
-                    self._log("map: lowest apex %.2f at %.1f,%.1f - "
-                              "re-climbing there" % (best[2], best[0], best[1]))
-                    cur = best
-                    d = 2.
-                    for _ in range(12):
-                        up = None
-                        for (dx, dy) in ((1,0),(-1,0),(0,1),(0,-1)):
-                            h = self._probe_down(cur[0] + dx*d, cur[1] + dy*d,
-                                                 safe, 'map+')
-                            if h and h[2] > cur[2] + 0.05 and (up is None
-                                                              or h[2] > up[2]):
-                                up = h
-                        if up:
-                            cur = up
-                            continue
-                        if d > 0.5:
-                            d /= 2.
-                            continue
-                        break
-                    break
-                continue
-            if h2 and h2[2] < cur[2] - 0.5:
-                cur = h2
-                d = 2.
-                for _ in range(12):
-                    up = None
-                    for (dx, dy) in ((1,0),(-1,0),(0,1),(0,-1)):
-                        h = self._probe_down(cur[0] + dx*d, cur[1] + dy*d,
-                                             safe, 'discover+')
-                        if h and h[2] > cur[2] + 0.05 and (up is None
-                                                          or h[2] > up[2]):
-                            up = h
-                    if up:
-                        cur = up
-                        continue
-                    if d > 0.5:
-                        d /= 2.
-                        continue
-                    break
-                break
-        self._log("ball_top discovered: %.2f at %.1f,%.1f (first contact "
-                  "was %.2f)" % (cur[2], cur[0], cur[1], hit[2]))
-        self._log("SPEED-UP CONFIG: set  ball_top: %.2f  in "
-                  "[tool_offset_sphere] (skips this discovery "
-                  "step - the run gets faster AND gentler)"
-                  % cur[2], 0)
-        return cur
-
-    def _tap_run(self, gcmd):
-        self._bounds()
-        ball_top = gcmd.get_float('BALL_TOP', self.ball_top, minval=0.)
-        start = (self.cx, self.cy)
-        # remembered ball position from the last discovery (the probe is
-        # placed "roughly in the same spot" every time)
-        try:
-            import json as _json
-            _st = _json.load(open(self._ballpos_path))
-            start = (_st['x'], _st['y'])
-        except Exception:
-            pass
-        if not ball_top:
-            found = self._tap_discover(gcmd)
-            ball_top = found[2]
-            start = (found[0], found[1])
-
-        # ---- head A ----
-        apex_a = self._tap_measure(start[0], start[1], 4, 2,
-                                   (0.9, 1.9, 2.9), ball_top,
-                                   self.tap_hops_a, 'A')
-        if not apex_a:
-            raise gcmd.error("Head A did not find the ball (tap mode)")
-        self._log("apex A: X%.2f Y%.2f Z%.2f" % apex_a, 1)
-        try:
-            import json as _json
-            _json.dump({'x': apex_a[0], 'y': apex_a[1]},
-                       open(self._ballpos_path, 'w'))
-        except Exception:
-            pass
-        # ---- park A LEFT, switch to B ----
-        self._move(apex_a[0], apex_a[1], ball_top + 6., self.lift_speed)
-        self._move(self._park(True), apex_a[1], ball_top + 6.,
-                   self.travel_speed)
-        self.gcode.run_script_from_command(self.switch_b)
-        # stored B offset is the prior (stale by a fraction of a mm)
-        try:
-            iv = self.printer.lookup_object('gcode_macro IDEX_VARS')
-            st = iv.get_status(self.reactor.monotonic())
-            pox, poy = st.get('offset_x', 0.), st.get('offset_y', 0.)
-        except Exception:
-            pox, poy = 0., 0.
-        self._log("head B prior from stored offset: %.2f,%.2f" % (pox, poy), 1)
-        apex_b = self._tap_measure(apex_a[0] - pox, apex_a[1] - poy, 12, 4,
-                                   (0.9, 1.9, 2.9), ball_top,
-                                   self.tap_hops_b, 'B')
-        if not apex_b:
-            raise gcmd.error("Head B did not find the ball (tap mode)")
-        self._log("apex B: X%.2f Y%.2f Z%.2f" % apex_b, 1)
-        # ---- park B right, revision A ----
-        self._move(self._park(False), apex_a[1], ball_top + 6.,
-                   self.travel_speed)
-        self.gcode.run_script_from_command(self.switch_a)
-        apex_a2 = self._tap_measure(apex_a[0], apex_a[1], 2, 2,
-                                    (0.9, 1.9, 2.9), ball_top,
-                                    self.tap_hops_a, 'rev')
-        if not apex_a2:
-            apex_a2 = apex_a
-        drift = math.dist(apex_a, apex_a2)
-        self._log("apex A (revision): X%.2f Y%.2f Z%.2f" % apex_a2, 1)
-        if drift > 2.0:
-            raise gcmd.error(
-                "Ball moved %.2fmm during the run - measurement invalid. "
-                "Secure the ball probe on the bed and rerun. "
-                "Offsets NOT applied." % drift)
-        if drift > 0.2:
-            self._log("ball moved slightly between passes (drift %.2fmm) - "
-                      "offset from the revision" % drift, 0)
-        off = (apex_b[0] - apex_a2[0], apex_b[1] - apex_a2[1],
-               apex_b[2] - apex_a2[2])
-        self._log("MEASURED (machine frame): dX%.3f dY%.3f dZ%.3f" % off, 1)
-        # IDEX_VARS sign convention (verified on the real printer,
-        # 2026-08-25): the stored offset equals the machine-frame
-        # measurement as-is - offset_x/y = apexB - apexA, offset_z = dZ.
-        # (The macros' SET_GCODE_OFFSET consumes it such that the flip
-        # was wrong: with -8.341 the heads mirrored around the target.)
-        apply = (off[0], off[1], off[2])
-        self._log("IDEX_VARS values:      offset_x=%.3f offset_y=%.3f "
-                  "offset_z=%.3f" % apply, 1)
-        if (abs(apply[0]) > self.max_off_xy or abs(apply[1]) > self.max_off_xy
-                or abs(apply[2]) > self.max_off_z):
-            raise gcmd.error(
-                "Measured offset dX%.2f dY%.2f dZ%.2f exceeds the plausible "
-                "range (+/-%.0f XY, +/-%.0f Z) - the ball was probably "
-                "knocked off mid-run or the switch false-triggered. "
-                "Offsets NOT applied." % (apply + (self.max_off_xy,
-                                                   self.max_off_z)))
-        if gcmd.get_int('DRY_RUN', 0):
-            self._log("DRY_RUN: offsets are not applied", 1)
-            return
-        for name, val in (('offset_x', apply[0]), ('offset_y', apply[1]),
-                          ('offset_z', apply[2])):
-            self.gcode.run_script_from_command(
-                "SET_GCODE_VARIABLE MACRO=IDEX_VARS VARIABLE=%s VALUE=%.3f"
-                % (name, val))
-        self.gcode.run_script_from_command("SAVE_OFFSETS_TO_DISK")
-        try:
-            self.gcode.run_script_from_command("DISPLAY_CURRENT_OFFSETS")
-        except self.printer.command_error:
-            pass
-        self.gcode.run_script_from_command(
-            "M117 B offset: dX%.3f dY%.3f dZ%.3f" % apply)
-    # ---------------- main cycle ----------------
-    def cmd_query(self, gcmd):
-        toolhead = self._toolhead()
-        pt = toolhead.get_last_move_time()
-        self.gcode.respond_info("ball probe: %s" % (
-            "TRIGGERED" if self.mcu_endstop.query_endstop(pt) else "open"))
-    def cmd_noise(self, gcmd):
-        # Which motion shakes a false trigger out of the ball switch:
-        # wiggle one axis at a time and sample the endstop between moves.
-        toolhead = self._toolhead()
-        if toolhead.get_status(self.reactor.monotonic())['homed_axes'] != 'xyz':
-            raise gcmd.error("Home all axes first")
-        self._bounds()
-        pos = list(self._pos())
-        z_safe = max(pos[2], self.safe_z_cold)
-        def sample(n):
-            hits = 0
-            for _ in range(n):
-                toolhead.dwell(0.02)
-                if self.mcu_endstop.query_endstop(
-                        toolhead.get_last_move_time()):
-                    hits += 1
-            return hits
-        def wiggle(axis, delta, times):
-            hits = 0
-            for i in range(times):
-                v = pos[axis] + (delta if i % 2 == 0 else -delta)
-                p = list(self._pos()); p[axis] = v
-                self._toolhead().manual_move(p, 60.)
-                hits += sample(4)
-            return hits
-        res = {}
-        res['idle'] = sample(20)
-        # park away from the ball zone first (X edge, ball sits near center)
-        self._move(self._park(True), pos[1], z_safe, self.travel_speed)
-        pos = list(self._pos())
-        res['X_wiggle'] = wiggle(0, 3., 5)
-        res['Y_wiggle'] = wiggle(1, 3., 5)
-        res['Z_wiggle'] = wiggle(2, 1., 5)
-        # the real failure mode: 3 probe descents far from the ball
-        inst = 0
-        for _ in range(3):
-            hit = self._probe_down(self._park(True) + 10., pos[1],
-                                   z_safe, 'noise')
-            if hit is None and self._log:
-                pass
-        self.gcode.respond_info(
-            "noise test (flickers): idle %d/20, X %d/20, Y %d/20, Z %d/20"
-            % (res['idle'], res['X_wiggle'], res['Y_wiggle'], res['Z_wiggle']))
-    def cmd_probetest(self, gcmd):
-        # Decisive test: a downward probing_move that "clicks" at its very
-        # start while query_endstop says open AND an upward probing_move that
-        # "clicks" too = the hardware trigger path is misbehaving, not the
-        # switch. Prints pin state before/after each attempt.
-        toolhead = self._toolhead()
-        if toolhead.get_status(self.reactor.monotonic())['homed_axes'] != 'xyz':
-            raise gcmd.error("Home all axes first")
-        self._bounds()
-        phoming = self.printer.lookup_object('homing')
-        pos = list(self._pos())
-        if pos[2] < self.safe_z_cold:
-            self._move(pos[0], pos[1], self.safe_z_cold, self.lift_speed)
-            pos = list(self._pos())
-        def q(tag):
-            v = self.mcu_endstop.query_endstop(
-                toolhead.get_last_move_time())
-            self.gcode.respond_info("// %s: query=%s" % (tag, v))
-            return v
-        for i in range(3):
-            q("down %d before" % i)
-            p0 = list(self._pos())
-            try:
-                epos = phoming.probing_move(self.mcu_endstop,
-                                            [p0[0], p0[1], p0[2] - 2.],
-                                            self.probe_speed)
-            except self.printer.command_error as e2:
-                q("down %d after" % i)
-                self.gcode.respond_info(
-                    "// down %d: clean miss (no trigger): %s" % (i, e2))
-                self._move(p0[0], p0[1], p0[2], self.lift_speed)
-                continue
-            q("down %d after" % i)
-            self.gcode.respond_info(
-                "// down %d: start Z%.3f -> reported Z%.3f (triggered at +%0.3fmm)"
-                % (i, p0[2], epos[2], p0[2] - epos[2]))
-            # lift back
-            self._move(p0[0], p0[1], p0[2], self.lift_speed)
-            q("up %d before" % i)
-            p1 = list(self._pos())
-            epos2 = phoming.probing_move(self.mcu_endstop,
-                                         [p1[0], p1[1], p1[2] + 2.],
-                                         self.probe_speed)
-            q("up %d after" % i)
-            self.gcode.respond_info(
-                "// up %d: start Z%.3f -> reported Z%.3f"
-                % (i, p1[2], epos2[2]))
-            self._move(p1[0], p1[1], p1[2], self.lift_speed)
+    # ---------------- commands ----------------
     def cmd_run(self, gcmd):
-        if gcmd.get('MODE', 'SPHERE').upper() == 'TAP':
-            toolhead = self._toolhead()
-            if toolhead.get_status(self.reactor.monotonic())['homed_axes'] != 'xyz':
-                raise gcmd.error("Home all axes first")
-            self._log("=== ball-probe offset calibration (tap: top-only) ===")
-            return self._tap_run(gcmd)
         toolhead = self._toolhead()
         if toolhead.get_status(self.reactor.monotonic())['homed_axes'] != 'xyz':
             raise gcmd.error("Home all axes first")
-        self._bounds()
-        ball_top = gcmd.get_float('BALL_TOP', self.ball_top, minval=0.)
+        try:
+            os.remove(self._trace_path)
+        except OSError:
+            pass
+        self._log("=== ball-probe offset calibration (v10) ===")
+        core = BallparkCore(self._hw(), self._log,
+                            lambda: self.reactor.monotonic(),
+                            ball_r=self.ball_r, bounds=self._get_bounds(),
+                            edge_margin=self.edge, floor_z=self.floor_z,
+                            travel_cold_z=self.travel_cold_z)
         dry = gcmd.get_int('DRY_RUN', 0)
-        self._log("=== ball-probe offset calibration (sphere v8) ===")
-        self._log("ball top: %s" % ("%.1f (from config)" % ball_top
-                                       if ball_top else "auto-discovery"))
-        travel_z = lambda: max(ball_top + 5., self.safe_z_cold)
-        # --- pass A ---
-        seed = self._scan(ball_top)
-        if not seed:
-            raise gcmd.error("Ball not found in the scan zone - move the probe")
-        apex_a = self._measure(seed, ball_top)
-        self._log("apex A: X%.2f Y%.2f Z%.2f" % apex_a, 1)
-        if not ball_top:
-            ball_top = apex_a[2]
-            self._log("SPEED-UP CONFIG: ball_top=%.2f "
-                      "(set it in [tool_offset_sphere]; ball XY is not saved)"
-                      % ball_top, 0)
-        # --- park A, head B ---
-        self._move(apex_a[0], apex_a[1], travel_z(), self.lift_speed)
-        self._move(self._park(True), apex_a[1], travel_z(), self.travel_speed)
-        self.gcode.run_script_from_command(self.switch_b)
-        seed = self._seed_b(apex_a, ball_top)
-        if not seed:
-            raise gcmd.error("Head B did not find the ball near apex A")
-        apex_b = self._measure(seed, ball_top)
-        self._log("apex B: X%.2f Y%.2f Z%.2f" % apex_b, 1)
-        # --- park B, revision A ---
-        self._move(self._park(False), apex_a[1], travel_z(), self.travel_speed)
-        self.gcode.run_script_from_command(self.switch_a)
-        seed = self._probe_down(apex_a[0], apex_a[1],
-                                self._safe_z(ball_top), 'revision')
-        apex_a2 = self._measure(seed, ball_top) if seed else apex_a
-        drift = math.dist(apex_a, apex_a2)
-        if drift > 2.0:
-            # the ball walked mid-run (head B pressed its shoulder): every
-            # apex was measured at a different ball position - the offset
-            # would be garbage. Refuse; the probe must sit secure on the bed
-            raise gcmd.error(
-                "Ball moved %.2fmm during the run - the measurement is "
-                "invalid. Secure the ball probe on the bed (tape/magnet/"
-                "holder) and rerun. Offsets NOT applied." % drift)
-        if drift > 0.2:
-            self._log("ball moved slightly between passes (drift %.2fmm) - "
-                      "offset from the revision" % drift, 0)
-        self._log("apex A (revision): X%.2f Y%.2f Z%.2f" % apex_a2, 1)
-        # --- offset ---
-        off = (apex_b[0]-apex_a2[0], apex_b[1]-apex_a2[1], apex_b[2]-apex_a2[2])
-        self._log("MEASURED B offset: dX%.3f dY%.3f dZ%.3f" % off, 1)
-        if (abs(off[0]) > self.max_off_xy or abs(off[1]) > self.max_off_xy
-                or abs(off[2]) > self.max_off_z):
-            # way outside what a head drift can be: the run was corrupted
-            # (probe knocked the ball off / false triggers). NEVER apply.
-            raise gcmd.error(
-                "Measured offset dX%.2f dY%.2f dZ%.2f exceeds the plausible "
-                "range (+/-%.0f XY, +/-%.0f Z) - the ball was probably "
-                "knocked off mid-run or the switch false-triggered. "
-                "Offsets NOT applied." % (off + (self.max_off_xy,
-                                                 self.max_off_z)))
+        try:
+            off = core.run(dry=dry)
+        except CoreError as e:
+            raise gcmd.error(str(e))
+        self._log("%d presses, %.0fs" % (core.press_count,
+                                         core.clock() - core.t0), 1)
         if dry:
-            self._log("DRY_RUN: offsets are not applied", 1)
             return
         for name, val in (('offset_x', off[0]), ('offset_y', off[1]),
                           ('offset_z', off[2])):
@@ -1003,9 +908,88 @@ class ToolOffsetSphere:
             pass
         self.gcode.run_script_from_command(
             "M117 B offset: dX%.3f dY%.3f dZ%.3f" % off)
-    cmd_run.__doc__ = ("Full head-B offset calibration via the ball probe "
-                       "(scan->climb->sphere->verify->revision A). "
-                       "Params: BALL_TOP=.., DRY_RUN=1")
+    cmd_run.__doc__ = ("Calibrate the offsets between T0 and T1 via the "
+                       "ball probe (v10 converging-stencil). "
+                       "Params: DRY_RUN=1")
+
+    def cmd_query(self, gcmd):
+        toolhead = self._toolhead()
+        pt = toolhead.get_last_move_time()
+        self.gcode.respond_info("ball probe: %s" % (
+            "TRIGGERED" if self.mcu_endstop.query_endstop(pt) else "open"))
+
+    def cmd_noise(self, gcmd):
+        toolhead = self._toolhead()
+        if toolhead.get_status(self.reactor.monotonic())['homed_axes'] != 'xyz':
+            raise gcmd.error("Home all axes first")
+        self._get_bounds()
+        pos = list(self._pos())
+        z_safe = max(pos[2], self.travel_cold_z)
+
+        def sample(n):
+            hits = 0
+            for _ in range(n):
+                toolhead.dwell(0.02)
+                if self.mcu_endstop.query_endstop(
+                        toolhead.get_last_move_time()):
+                    hits += 1
+            return hits
+
+        def wiggle(axis, delta, times):
+            hits = 0
+            for i in range(times):
+                p = list(self._pos())
+                p[axis] = pos[axis] + (delta if i % 2 == 0 else -delta)
+                toolhead.manual_move(p, 60.)
+                hits += sample(4)
+            return hits
+        res = {'idle': sample(20)}
+        b = self._get_bounds()
+        self._toolhead().manual_move([b[0] + 10., pos[1], z_safe],
+                                     self.travel_speed)
+        pos = list(self._pos())
+        res['X_wiggle'] = wiggle(0, 3., 5)
+        res['Y_wiggle'] = wiggle(1, 3., 5)
+        res['Z_wiggle'] = wiggle(2, 1., 5)
+        for _ in range(3):
+            self.press(b[0] + 20., pos[1], self.floor_z, z_safe)
+        self.gcode.respond_info(
+            "noise test (flickers): idle %d/20, X %d/20, Y %d/20, Z %d/20"
+            % (res['idle'], res['X_wiggle'], res['Y_wiggle'], res['Z_wiggle']))
+
+    def cmd_probetest(self, gcmd):
+        toolhead = self._toolhead()
+        if toolhead.get_status(self.reactor.monotonic())['homed_axes'] != 'xyz':
+            raise gcmd.error("Home all axes first")
+        self._get_bounds()
+        phoming = self.printer.lookup_object('homing')
+        pos = list(self._pos())
+        if pos[2] < self.travel_cold_z:
+            self._toolhead().manual_move([pos[0], pos[1], self.travel_cold_z],
+                                         self.lift_speed)
+
+        def q(tag):
+            v = self.mcu_endstop.query_endstop(toolhead.get_last_move_time())
+            self.gcode.respond_info("// %s: query=%s" % (tag, v))
+            return v
+        for i in range(3):
+            q("down %d before" % i)
+            p0 = list(self._pos())
+            try:
+                epos = phoming.probing_move(self.mcu_endstop,
+                                            [p0[0], p0[1], p0[2] - 2.],
+                                            self.probe_speed)
+            except self.printer.command_error as e2:
+                q("down %d after" % i)
+                self.gcode.respond_info(
+                    "// down %d: clean miss (no trigger): %s" % (i, e2))
+                continue
+            q("down %d after" % i)
+            self.gcode.respond_info(
+                "// down %d: start Z%.3f -> reported Z%.3f (triggered at +%0.3fmm)"
+                % (i, p0[2], epos[2], p0[2] - epos[2]))
+            self._toolhead().manual_move(p0[:3], self.lift_speed)
+
 
 def load_config(config):
     return ToolOffsetSphere(config)
