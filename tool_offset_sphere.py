@@ -791,22 +791,23 @@ class ToolOffsetSphere:
         off = (apex_b[0] - apex_a2[0], apex_b[1] - apex_a2[1],
                apex_b[2] - apex_a2[2])
         self._log("MEASURED (machine frame): dX%.3f dY%.3f dZ%.3f" % off, 1)
-        # IDEX_VARS sign convention (verified on the real printer,
-        # 2026-08-25): the stored offset equals the machine-frame
-        # measurement as-is - offset_x/y = apexB - apexA, offset_z = dZ.
-        # (The macros' SET_GCODE_OFFSET consumes it such that the flip
-        # was wrong: with -8.341 the heads mirrored around the target.)
-        apply = (off[0], off[1], off[2])
+        # IDEX_VARS conventions (verified on the real printer, 2026-08-25):
+        # offset_x/y = apexB - apexA as-is (macros apply the full delta to
+        # T1 via SET_GCODE_OFFSET X/Y). But the kit's macros apply Z
+        # SYMMETRICALLY (T0: tweaked_z - offset_z, T1: tweaked_z + offset_z),
+        # so the machine-Z delta between heads is 2*offset_z and the stored
+        # value must be HALF the measured dZ.
+        apply = (off[0], off[1], off[2] / 2.)
         self._log("IDEX_VARS values:      offset_x=%.3f offset_y=%.3f "
-                  "offset_z=%.3f" % apply, 1)
-        if (abs(apply[0]) > self.max_off_xy or abs(apply[1]) > self.max_off_xy
-                or abs(apply[2]) > self.max_off_z):
+                  "offset_z=%.3f (dZ/2)" % apply, 1)
+        if (abs(off[0]) > self.max_off_xy or abs(off[1]) > self.max_off_xy
+                or abs(off[2]) > self.max_off_z):
             raise gcmd.error(
                 "Measured offset dX%.2f dY%.2f dZ%.2f exceeds the plausible "
                 "range (+/-%.0f XY, +/-%.0f Z) - the ball was probably "
                 "knocked off mid-run or the switch false-triggered. "
-                "Offsets NOT applied." % (apply + (self.max_off_xy,
-                                                   self.max_off_z)))
+                "Offsets NOT applied." % (off + (self.max_off_xy,
+                                                 self.max_off_z)))
         if gcmd.get_int('DRY_RUN', 0):
             self._log("DRY_RUN: offsets are not applied", 1)
             return
@@ -978,6 +979,9 @@ class ToolOffsetSphere:
         # --- offset ---
         off = (apex_b[0]-apex_a2[0], apex_b[1]-apex_a2[1], apex_b[2]-apex_a2[2])
         self._log("MEASURED B offset: dX%.3f dY%.3f dZ%.3f" % off, 1)
+        # X/Y: full delta to T1; Z: the kit applies 2*offset_z between
+        # heads, so store dZ/2 (see the TAP apply path for details).
+        apply = (off[0], off[1], off[2] / 2.)
         if (abs(off[0]) > self.max_off_xy or abs(off[1]) > self.max_off_xy
                 or abs(off[2]) > self.max_off_z):
             # way outside what a head drift can be: the run was corrupted
@@ -991,8 +995,8 @@ class ToolOffsetSphere:
         if dry:
             self._log("DRY_RUN: offsets are not applied", 1)
             return
-        for name, val in (('offset_x', off[0]), ('offset_y', off[1]),
-                          ('offset_z', off[2])):
+        for name, val in (('offset_x', apply[0]), ('offset_y', apply[1]),
+                          ('offset_z', apply[2])):
             self.gcode.run_script_from_command(
                 "SET_GCODE_VARIABLE MACRO=IDEX_VARS VARIABLE=%s VALUE=%.3f"
                 % (name, val))
