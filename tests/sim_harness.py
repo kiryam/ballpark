@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Ballpark v10 test harness: physics simulation + stress grids.
 
-Physics ported from the validated browser sim (sim/sim3d.html):
+Physics ported from the validated browser sim (removed from the repo
+after v10; this harness is now the reference physics model):
   - head elements {dx, dy, r, zo}: a vertical press clicks at the nozzle
     height where the highest-reaching element touches the ball
     (zc = ball_surface(horiz) - zo), if zc is inside [floor, travel];

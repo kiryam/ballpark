@@ -123,14 +123,16 @@ python3 tests/sim_harness.py all              # grid + regressions + budgets
 python3 tests/sim_harness.py debug stale_bt   # verbose single case
 ```
 
-Physics: element-based head contacts (ported from the validated
-`sim/sim3d.html`), lever pre-travel, X/Y readout slop, readout glitches,
-ball nudges from shoulder presses, ball bumps at the head switch, and
-the probe body ring. The 3D visual simulator (`sim/sim3d.html`) still
-contains the v8/v9 reference implementation.
+Physics: element-based head contacts (ported from the since-removed
+validated 3D simulator), lever pre-travel, X/Y readout slop, readout
+glitches, ball nudges from shoulder presses, ball bumps at the head
+switch, and the probe body ring.
 
-## Licenses
+Validated on hardware (2026-08-26, IDEX/CAN machine): a full
+A -> B -> revision cycle completes in 167 presses / ~10 min with an
+apex repeatability of 0.02 mm between passes; every failure path
+(budgets, plausibility gates) aborts cleanly without applying anything.
 
-Code: Apache-2.0 (see [LICENSE](LICENSE)). Vendored assets under their
-own licenses: three.js examples (MIT), STL Voron StealthBurner /
-Clockwork2 (CC-BY-NC-SA, VoronDesign) — see [NOTICE](NOTICE).
+## License
+
+Code: Apache-2.0 (see [LICENSE](LICENSE)).
