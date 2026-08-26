@@ -47,6 +47,17 @@ DEST="$CONFIG_DIR/ballpark"
 mkdir -p "$DEST"
 cp tool_offset_sphere.py tool_offset_sphere.cfg "$DEST/"
 ln -sfn "$DEST/tool_offset_sphere.py" "$KLIPPER_DIR/klippy/extras/tool_offset_sphere.py"
+# the plugin persists learned ball state (.ball-state.json) next to its
+# copy - klippy must be able to write there. Root-mode installs (ssh /
+# update_manager) otherwise leave the dir root-owned and every run
+# silently cold-starts (state_save is try/except-pass).
+if [ "$(id -u)" = 0 ]; then
+  CFG_OWNER="$(stat -c %U "$CONFIG_DIR/printer.cfg" 2>/dev/null || true)"
+  if [ -n "$CFG_OWNER" ] && [ "$CFG_OWNER" != "root" ]; then
+    chown -R "$CFG_OWNER" "$DEST"
+    echo "==> fixed ownership: $DEST -> $CFG_OWNER (klippy user)"
+  fi
+fi
 echo "==> plugin installed: $DEST + extras symlink"
 
 # migrate away the pre-flat-layout copy (avoids a duplicate section)

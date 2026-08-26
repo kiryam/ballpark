@@ -849,7 +849,16 @@ class ToolOffsetSphere:
                 adapter._toolhead().manual_move([pos[0], pos[1], z],
                                                 adapter.lift_speed)
                 b = adapter._get_bounds()
-                px = (b[0] + 10.) if left else (b[1] - 10.)
+                if left:
+                    px = b[0] + 10.
+                    # the kit toolchange re-approaches the park position
+                    # with head B active (gcode offset applied) - stay in
+                    # the window BOTH heads can reach: the dual carriage
+                    # has its own min limit (1mm on vostok), so
+                    # |offset_x| + margin from zero is the safe floor
+                    px = max(px, abs(hw.prior()[0]) + 15.)
+                else:
+                    px = b[1] - 10.
                 adapter._toolhead().manual_move([px, pos[1], z],
                                                 adapter.travel_speed)
             def switch_b(hw):
